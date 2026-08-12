@@ -57,7 +57,6 @@ namespace fcitx {
             lotusEngine_.reset(NewEngine(engine_->config().inputMethod->data(), engine_->dictionary(), engine_->macroTable()));
         }
         setOption();
-        resetMacroSkip();
     }
 
     void LotusState::setOption() {
@@ -103,7 +102,6 @@ namespace fcitx {
             return true;
         }
         LOTUS_ERROR("Failed to connect to socket: " + std::string(strerror(errno)));
-        close(current_fd);
         int old_fd = uinput_client_fd_.exchange(-1);
         if (old_fd != -1) {
             close(old_fd);
@@ -194,6 +192,12 @@ namespace fcitx {
     }
 
     void LotusState::handlePreeditMode(KeyEvent& keyEvent, KeySym currentSym) {
+        if (currentSym == FcitxKey_Return || currentSym == FcitxKey_KP_Enter) {
+            commitBuffer();
+            keyEvent.forward();
+            return;
+        }
+
         if (EngineProcessKeyEvent(lotusEngine_.handle(), currentSym, keyEvent.rawKey().states()) != 0U)
             keyEvent.filterAndAccept();
         if (auto commit = UniqueCPtr<char>(EnginePullCommit(lotusEngine_.handle()))) {
@@ -211,7 +215,7 @@ namespace fcitx {
             if (utf8::validate(view))
                 text.append(std::string(view), fmt);
             text.setCursor(static_cast<int>(text.textLength()));
-            if (ic_->capabilityFlags().test(CapabilityFlag::Preedit))
+            if (*engine_->config().inlinePreedit && ic_->capabilityFlags().test(CapabilityFlag::Preedit))
                 ic_->inputPanel().setClientPreedit(text);
             else
                 ic_->inputPanel().setPreedit(text);
@@ -476,6 +480,11 @@ namespace fcitx {
 
     void LotusState::performReplacement(const std::string& deletedPart, const std::string& addedPart) {
         LOTUS_INFO("Perform replacement: " + deletedPart + " -> " + addedPart); //NOLINT
+
+        if (performSurroundingReplacement(deletedPart, addedPart)) {
+            return;
+        }
+
         current_backspace_count_ = 0;
         pending_commit_string_   = addedPart;
         expected_backspaces_     = static_cast<int>(utf8::length(deletedPart));
@@ -492,9 +501,51 @@ namespace fcitx {
                 }
             }
         }
+
+        if (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+
         is_deleting_.store(true, std::memory_order_release);
         send_backspace_uinput(expected_backspaces_);
         LOTUS_INFO("Send " + std::to_string(expected_backspaces_) + " backspaces");
+    }
+
+    bool LotusState::performSurroundingReplacement(const std::string& deletedPart, const std::string& addedPart) {
+        if (deletedPart.empty() || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+            return false;
+        }
+
+        const auto& surrounding = ic_->surroundingText();
+        if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor()) {
+            return false;
+        }
+
+        const size_t charsToDelete = utf8::length(deletedPart);
+        if (charsToDelete == 0 || surrounding.cursor() < charsToDelete) {
+            return false;
+        }
+
+        ic_->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+        if (!addedPart.empty()) {
+            ic_->commitString(addedPart);
+            LOTUS_INFO("Commit: " + addedPart);
+        }
+
+        const auto oldLen = realtextLen.load(std::memory_order_acquire);
+        const auto addLen = static_cast<unsigned int>(utf8::length(addedPart));
+        const auto delLen = static_cast<unsigned int>(charsToDelete);
+        realtextLen.store(oldLen > delLen ? oldLen - delLen + addLen : addLen, std::memory_order_release);
+
+        expected_backspaces_     = 0;
+        current_backspace_count_ = 0;
+        pending_commit_string_.clear();
+        is_deleting_.store(false, std::memory_order_release);
+
+        if (!buffered_keys_.empty()) {
+            replayBufferedKeys();
+        }
+        return true;
     }
 
     bool LotusState::checkForwardSpecialKey(KeyEvent& keyEvent, KeySym& currentSym) {
@@ -966,14 +1017,7 @@ namespace fcitx {
     }
 
     void LotusState::keyEvent(KeyEvent& keyEvent) {
-        if (!lotusEngine_)
-            return;
-        if (keyEvent.rawKey().isModifier()) {
-            handleModifierTap(keyEvent);
-            return;
-        }
-        cancelModifierTap();
-        if (keyEvent.isRelease())
+        if (!lotusEngine_ || keyEvent.isRelease() || keyEvent.rawKey().isModifier())
             return;
         if (uinput_client_fd_ < 0) {
             LOTUS_WARN("Cannot connect to uinput server, reconnecting....");
@@ -1106,7 +1150,11 @@ namespace fcitx {
                 break;
             }
             case LotusMode::Preedit: {
-                handlePreeditMode(keyEvent, currentSym);
+                if (!*engine_->config().inlinePreedit && ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                    handleSurroundingText(keyEvent, currentSym);
+                } else {
+                    handlePreeditMode(keyEvent, currentSym);
+                }
                 break;
             }
             case LotusMode::Emoji: {
@@ -1120,7 +1168,6 @@ namespace fcitx {
                 break;
             }
         }
-        reEnableMacroAfterWordEnd();
     }
 
     void LotusState::reset(bool isFocusOut) {
@@ -1131,7 +1178,6 @@ namespace fcitx {
         if (is_deleting_.load(std::memory_order_acquire)) {
             return;
         }
-        resetMacroSkip();
 
         if (lotusEngine_) {
             isPrevSpace_       = false;
@@ -1216,7 +1262,6 @@ namespace fcitx {
         if (is_deleting_.load(std::memory_order_acquire)) {
             return;
         }
-        resetMacroSkip();
         oldPreBuffer_.clear();
         hasHistory_ = false;
         if (!is_deleting_.load(std::memory_order_acquire)) {
@@ -1304,6 +1349,8 @@ namespace fcitx {
                     if (!addedPart.empty()) {
                         ic_->commitString(addedPart);
                         oldPreBuffer_ = preeditStr;
+                    } else {
+                        ic_->commitString(keyUtf8);
                     }
                 } else {
                     if (uinput_client_fd_ < 0) {
@@ -1328,61 +1375,5 @@ namespace fcitx {
             }
         }
         LOTUS_INFO("Replay buffered keys done");
-    }
-
-    bool LotusState::isMacroSkipModifier(KeySym sym) const {
-        const auto trigger = engine_->config().macroSkipTriggerModifier.value();
-        switch (trigger) {
-            case MacroSkipTriggerModifier::Shift: return sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
-            case MacroSkipTriggerModifier::Ctrl: return sym == FcitxKey_Control_L || sym == FcitxKey_Control_R;
-            case MacroSkipTriggerModifier::Alt: return sym == FcitxKey_Alt_L || sym == FcitxKey_Alt_R;
-            case MacroSkipTriggerModifier::Disabled:
-            default: return false;
-        }
-    }
-
-    void LotusState::handleModifierTap(const KeyEvent& keyEvent) {
-        const auto trigger = engine_->config().macroSkipTriggerModifier.value();
-        if (trigger == MacroSkipTriggerModifier::Disabled || !*engine_->config().enableMacro) {
-            return;
-        }
-        if (!isMacroSkipModifier(keyEvent.rawKey().sym())) {
-            tracking_modifier_tap_ = false;
-            return;
-        }
-        if (keyEvent.isRelease()) {
-            if (tracking_modifier_tap_) {
-                tracking_modifier_tap_ = false;
-                macro_skip_            = true;
-                EngineSetMacroEnabled(lotusEngine_.handle(), 0);
-                LOTUS_INFO("Macro skip enabled for next word");
-            }
-        } else {
-            tracking_modifier_tap_ = true;
-        }
-    }
-
-    void LotusState::cancelModifierTap() {
-        tracking_modifier_tap_ = false;
-    }
-
-    void LotusState::reEnableMacroAfterWordEnd() {
-        if (!macro_skip_) {
-            return;
-        }
-        UniqueCPtr<char> preedit(EnginePullPreedit(lotusEngine_.handle()));
-        if (preedit && *preedit.get() != 0) {
-            return;
-        }
-        macro_skip_ = false;
-        EngineSetMacroEnabled(lotusEngine_.handle(), *engine_->config().enableMacro ? 1 : 0);
-    }
-
-    void LotusState::resetMacroSkip() {
-        tracking_modifier_tap_ = false;
-        macro_skip_            = false;
-        if (lotusEngine_) {
-            EngineSetMacroEnabled(lotusEngine_.handle(), *engine_->config().enableMacro ? 1 : 0);
-        }
     }
 } // namespace fcitx

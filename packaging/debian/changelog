@@ -1,5 +1,5 @@
-fcitx5-lotus (3.5.0-1) unstable; urgency=medium
+fcitx5-lotus (3.4.1-1) unstable; urgency=medium
 
-  * Add skip macro modifier key option
+  * Fix bug replay buffer key on deletion
 
- -- Nguyen Hoang Ky <nhktmdzhg@gmail.com>  Sat, 08 Aug 2026 17:28:00 +0700
+ -- Nguyen Hoang Ky <nhktmdzhg@gmail.com>  Tue, 04 Aug 2026 10:47:00 +0700

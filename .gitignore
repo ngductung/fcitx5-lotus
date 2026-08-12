@@ -1,41 +1,112 @@
-build*/
-.*
-!.git*
-.git/
-*.tar.*
-*.kdev4
-*.kate-swp
-*.orig
-tags
-astyle.sh
-cscope.*
-*.part
-XF86keysym.h
-keysymdef.h
-*~
-!.clang-format
-!.clang-tidy
+# Root build and generated directories
+/build/
+/build*/
+/obj-*/
+/output/
+/out/
+/cmake-build-*/
+/.cache/
+/.codegraph/
 
-# CMake build files
+# CMake / compiler output
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-ecm_uninstall.cmake
+CTestTestfile.cmake
+Makefile
 install_manifest.txt
+ecm_uninstall.cmake
+compile_commands.json
+
+# Generated metadata and installation artifacts
 org.fcitx.Fcitx5.Addon.Lotus.metainfo.xml
 org.fcitx.Fcitx5.Addon.Lotus.metainfo.xml.in
-Makefile
-.vscode/
-compile_commands.json
-!.all-contributorsrc
+*.desktop
+*.service
+*.rules
+*.pc
+
+# Qt / automoc-generated files
+*_autogen/
+moc_*
+ui_*.h
+qrc_*.cpp
+
+# Compiled artifacts
+*.so
+*.so.*
+*.a
+*.o
+*.obj
+*.dylib
+*.dll
+*.exe
+*.bin
+lotus-version.h
+XF86keysym.h
+keysymdef.h
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs and editor temp files
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+.tags
+cscope.*
+tags
+astyle.sh
 refresh-contributor
 
-# Qt AUTOMOC generated files
-*_autogen/
+# Packaging artifacts
+/debian/
+/packaging/debian/.debhelper/
+/packaging/debian/debhelper-build-stamp
+/packaging/debian/files
+/packaging/debian/*.debhelper
+/packaging/debian/*.substvars
+/packaging/debian/fcitx5-lotus/
+*.deb
+*.ddeb
+*.rpm
+*.tar.*
 
-# Compiled outputs
-*.so
-lotus-version.h
-# Logs
-*.log
-__pycache__/
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.venv/
+venv/
+
+# Keep repo metadata tracked
+.*
+!.gitignore
+!.gitattributes
+!.gitmodules
+!.github/
+!.clang-format
+!.clang-tidy
+!.all-contributorsrc
+!.github/**
+
+# Explicitly keep common tracked repo files if needed
+!/.gitignore
+!/.gitmodules
+!/.gitattributes
+!/.all-contributorsrc
+!/.clang-format
+!/.clang-tidy
+
+# Local dev helper files
+*.kdev4
+*.kate-swp
+*.part

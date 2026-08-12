@@ -1,5 +1,5 @@
 Name:           fcitx5-lotus
-Version:        3.5.0
+Version:        3.4.1
 Release:        1
 Summary:        Vietnamese input method for fcitx5
 License:        GPL-3.0-or-later
@@ -169,5 +169,5 @@ fi
 %systemd_postun_with_restart fcitx5-lotus-server@.service
 
 %changelog
-* Sat Aug 08 2026 Nguyen Hoang Ky <nhktmdzhg@gmail.com> - 3.5.0-1
-- Add skip macro modifier key option
+* Tue Aug 04 2026 Nguyen Hoang Ky <nhktmdzhg@gmail.com> - 3.4.1-1
+- Fix bug replay buffer key on deletion
