@@ -98,7 +98,10 @@ namespace fcitx {
         std::string             pending_commit_string_;
         std::unique_ptr<EventSourceTime> pending_commit_fallback_timer_;
         std::unique_ptr<EventSource>     pending_replay_event_;
+        std::unique_ptr<EventSourceTime> pending_initial_hold_timer_;
         bool                    timer_driven_replacement_ = false;
+        bool                    pending_replacement_may_empty_input_ = false;
+        bool                    holding_initial_uinput_preedit_ = false;
         std::string             emojiBuffer_;
         std::vector<EmojiEntry> emojiCandidates_;
         bool                    waitAck_ = false;
@@ -186,6 +189,12 @@ namespace fcitx {
          * @brief Schedules buffered key replay outside the current key/timer callback.
          */
         void scheduleReplayBufferedKeys();
+
+        /**
+         * @brief Commits a hidden initial uinput preedit when no fast transform follows.
+         * @param resetTimer If true, cancels the hold timer.
+         */
+        void flushHeldInitialUinput(bool resetTimer = true);
 
         /**
          * @brief Schedules a fallback commit when a generated trigger backspace may be lost.
