@@ -42,7 +42,7 @@ class SettingsCategory(Enum):
 SETTINGS_MAP = {
     SettingsCategory.GENERAL: {
         "INPUT METHOD": ["InputMethod", "Mode", "OutputCharset"],
-        "TYPING": ["W2U", "BracketTransform"],
+        "TYPING": ["W2U"],
     },
     SettingsCategory.APPEARANCE: {
         "THEME & ICONS": ["UseLotusIcons", "IconTheme"],

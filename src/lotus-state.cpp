@@ -21,8 +21,6 @@
 #include <fcitx/userinterface.h>
 
 #include <algorithm>
-#include <cstdlib>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -40,8 +38,9 @@ namespace fcitx {
     constexpr bool     UINPUT_HOLD_INITIAL_PREEDIT            = true;
 
     static inline bool isWordBreak(uint32_t ucs4) {
-        // Space, tab, newline, carriage return, null, or punctuation/symbols (: ; < = > ? @)
-        return ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= 58 && ucs4 <= 64);
+        // Match Bamboo's punctuation-as-word-break behavior for surrounding-text rebuilds.
+        return ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= '!' && ucs4 <= '/') ||
+               (ucs4 >= '0' && ucs4 <= '9') || (ucs4 >= ':' && ucs4 <= '@') || (ucs4 >= '[' && ucs4 <= '`') || (ucs4 >= '{' && ucs4 <= '~');
     }
 
     static inline std::string keySymToBufferedUtf8(KeySym sym) {
@@ -58,23 +57,19 @@ namespace fcitx {
         return sym == FcitxKey_a || sym == FcitxKey_e || sym == FcitxKey_i || sym == FcitxKey_o || sym == FcitxKey_u || sym == FcitxKey_y || sym == FcitxKey_d;
     }
 
-    static inline bool isUinputDebugEnabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("LOTUS_UINPUT_DEBUG");
-            return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
-        }();
-        return enabled;
+    static inline bool isLiteralBraceKey(KeySym sym, uint32_t state) {
+        std::string keyUtf8 = Key::keySymToUTF8(sym);
+        return keyUtf8 == "{" || keyUtf8 == "}" ||
+               ((state & static_cast<uint32_t>(KeyState::Shift)) != 0U && (sym == FcitxKey_bracketleft || sym == FcitxKey_bracketright));
     }
 
-    static inline void debugUinputTrace(const std::string& msg) {
-        if (!isUinputDebugEnabled()) {
-            return;
-        }
-        std::ofstream out("/tmp/fcitx5-lotus-debug.log", std::ios::app);
-        if (out) {
-            out << ::now_ms() << " LOTUS_UINPUT_DEBUG " << msg << '\n';
-        }
+    static inline constexpr bool isUinputDebugEnabled() {
+        return false;
     }
+
+#define debugUinputTrace(msg) \
+    do {                      \
+    } while (false)
 
     static inline std::string previousWordFromSurrounding(const SurroundingText& surrounding) {
         if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor()) {
@@ -206,13 +201,13 @@ namespace fcitx {
                 close(old_fd);
             }
             if (connect_uinput_server()) {
-                LOTUS_INFO("Reconnected to uinput server successfully");
+                LOTUS_DEBUG("Reconnected to uinput server successfully");
                 send(uinput_client_fd_, &count, sizeof(count), MSG_NOSIGNAL);
             }
         }
 
         if (waitAck_) {
-            LOTUS_INFO("Waiting for ack");
+            LOTUS_DEBUG("Waiting for ack");
             std::this_thread::sleep_for(std::chrono::milliseconds(count * 5));
         }
     }
@@ -280,7 +275,7 @@ namespace fcitx {
             keyEvent.filterAndAccept();
         if (auto commit = UniqueCPtr<char>(EnginePullCommit(lotusEngine_.handle()))) {
             if (commit && (*commit.get() != 0)) {
-                LOTUS_INFO("Commit: " + std::string(commit.get()));
+                LOTUS_DEBUG("Commit: " + std::string(commit.get()));
                 ic_->commitString(commit.get());
             }
         }
@@ -554,7 +549,7 @@ namespace fcitx {
             // Validate surr cursor pos should match realtextLen after all BS applied
             const auto& surr = ic_->surroundingText();
             if (surr.isValid() && surr.cursor() == realtextLen.load(std::memory_order_acquire)) {
-                LOTUS_INFO("Skip retry");
+                LOTUS_DEBUG("Skip retry");
             } else {
                 // Retry x3 (2 ms each), khi can (chromium,electron,...)
                 for (int retry = 0; retry < 3; ++retry) {
@@ -586,7 +581,7 @@ namespace fcitx {
         }
         if (!commitString.empty()) {
             ic_->commitString(commitString);
-            LOTUS_INFO("Commit: " + commitString);
+            LOTUS_DEBUG("Commit: " + commitString);
             realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitString)), std::memory_order_acq_rel);
         }
 
@@ -669,7 +664,7 @@ namespace fcitx {
         if (!commitString.empty()) {
             ic_->commitString(commitString);
             realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitString)), std::memory_order_acq_rel);
-            LOTUS_INFO("Commit: " + commitString);
+            LOTUS_DEBUG("Commit: " + commitString);
         }
         hasHistory_ = !commitString.empty();
     }
@@ -747,7 +742,7 @@ namespace fcitx {
     }
 
     void LotusState::performReplacement(const std::string& deletedPart, const std::string& addedPart) {
-        LOTUS_INFO("Perform replacement: " + deletedPart + " -> " + addedPart); //NOLINT
+        LOTUS_DEBUG("Perform replacement: " + deletedPart + " -> " + addedPart); //NOLINT
         current_backspace_count_ = 0;
         pending_commit_string_   = addedPart;
         const auto deletedChars  = static_cast<int>(utf8::length(deletedPart));
@@ -807,7 +802,7 @@ namespace fcitx {
             ic_->deleteSurroundingText(-deletedChars, deletedChars);
             if (!addedPart.empty()) {
                 ic_->commitString(addedPart);
-                LOTUS_INFO("Commit: " + addedPart);
+                LOTUS_DEBUG("Commit: " + addedPart);
             }
             realtextLen.store((surrCursor - static_cast<unsigned int>(deletedChars)) + static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_release);
             expected_backspaces_     = 0;
@@ -840,7 +835,7 @@ namespace fcitx {
         }
         send_backspace_uinput(expected_backspaces_);
         debugUinputTrace("sent_backspaces expected=" + std::to_string(expected_backspaces_));
-        LOTUS_INFO("Send " + std::to_string(expected_backspaces_) + " backspaces");
+        LOTUS_DEBUG("Send " + std::to_string(expected_backspaces_) + " backspaces");
     }
 
     bool LotusState::checkForwardSpecialKey(KeyEvent& keyEvent, KeySym& currentSym) {
@@ -958,6 +953,16 @@ namespace fcitx {
             return;
         }
 
+        if (isLiteralBraceKey(currentSym, keyEvent.rawKey().states())) {
+            flushHeldInitialUinput();
+            hasHistory_ = false;
+            ResetEngine(lotusEngine_.handle());
+            oldPreBuffer_.clear();
+            keyEvent.forward();
+            realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
+            return;
+        }
+
         if (oldPreBuffer_.empty()) {
             std::string oldWord = previousWordFromSurrounding(ic_->surroundingText());
             if (!oldWord.empty()) {
@@ -1004,7 +1009,7 @@ namespace fcitx {
                     debugUinputTrace("direct_commit_after_initial_hold commit='" + commitStr + "'");
                     ic_->commitString(commitStr);
                     realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitStr)), std::memory_order_acq_rel);
-                    LOTUS_INFO("Commit: " + commitStr);
+                    LOTUS_DEBUG("Commit: " + commitStr);
                     keyEvent.filterAndAccept();
                 } else {
                     debugUinputTrace("flush_initial_then_commit_added commit='" + oldPreBuffer_ + "' added='" + addedPart + "'");
@@ -1044,7 +1049,7 @@ namespace fcitx {
                     }
                     ic_->commitString(addedPart);
                     realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_acq_rel);
-                    LOTUS_INFO("Commit: " + addedPart);
+                    LOTUS_DEBUG("Commit: " + addedPart);
                     keyEvent.filterAndAccept();
                 } else {
                     keyEvent.forward();
@@ -1094,7 +1099,7 @@ namespace fcitx {
                     debugUinputTrace("direct_preedit_after_initial_hold preedit='" + preeditStr + "'");
                     ic_->commitString(preeditStr);
                     realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(preeditStr)), std::memory_order_acq_rel);
-                    LOTUS_INFO("Commit: " + preeditStr);
+                    LOTUS_DEBUG("Commit: " + preeditStr);
                     keyEvent.filterAndAccept();
                     oldPreBuffer_ = preeditStr;
                     hasHistory_ = true;
@@ -1145,7 +1150,7 @@ namespace fcitx {
                     if (wa_chromium_flag || wasAutoCapitalized || addedPart != keyUtf8) {
                         ic_->commitString(addedPart);
                         realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_acq_rel);
-                        LOTUS_INFO("Commit: " + addedPart);
+                        LOTUS_DEBUG("Commit: " + addedPart);
                         if (!wa_chromium_flag) {
                             keyEvent.filterAndAccept();
                             isCommit = true;
@@ -1199,6 +1204,12 @@ namespace fcitx {
         }
 
         if (isBackspace(keyEvent.rawKey().sym())) {
+            ResetEngine(lotusEngine_.handle());
+            keyEvent.forward();
+            return;
+        }
+
+        if (isLiteralBraceKey(currentSym, keyEvent.rawKey().states())) {
             ResetEngine(lotusEngine_.handle());
             keyEvent.forward();
             return;
@@ -1281,7 +1292,7 @@ namespace fcitx {
 
                 if (!addedPart.empty()) {
                     ic->commitString(addedPart);
-                    LOTUS_INFO("Commit: " + addedPart);
+                    LOTUS_DEBUG("Commit: " + addedPart);
                 }
 
                 ResetEngine(lotusEngine_.handle());
@@ -1309,7 +1320,7 @@ namespace fcitx {
                 out += preeditPtr.get();
 
             if (!out.empty()) {
-                LOTUS_INFO("Commit: " + out);
+                LOTUS_DEBUG("Commit: " + out);
                 ic->commitString(out);
             }
 
@@ -1325,13 +1336,13 @@ namespace fcitx {
             case LotusMode::SurroundingText: {
                 ic_->deleteSurroundingText(-1, 1);
                 ic_->commitString(". ");
-                LOTUS_INFO("Commit: . ");
+                LOTUS_DEBUG("Commit: . ");
 
                 break;
             }
             default: { // Uinput, Smooth, Preedit, etc.
                 performReplacement(" ", ". ");
-                LOTUS_INFO("Commit: . ");
+                LOTUS_DEBUG("Commit: . ");
                 break;
             }
         }
@@ -1348,12 +1359,12 @@ namespace fcitx {
             case LotusMode::SurroundingText: {
                 ic_->deleteSurroundingText(-1, 1);
                 ic_->commitString(emDash);
-                LOTUS_INFO("Commit: — (em-dash)");
+                LOTUS_DEBUG("Commit: — (em-dash)");
                 break;
             }
             default: { // Uinput, Smooth, Preedit, etc.
                 performReplacement("-", emDash);
-                LOTUS_INFO("Commit: — (em-dash)");
+                LOTUS_DEBUG("Commit: — (em-dash)");
                 break;
             }
         }
@@ -1403,7 +1414,7 @@ namespace fcitx {
             }
 
             if (isMacroExpansion) {
-                LOTUS_INFO("Macro expansion: '" + oldPreBuffer_ + "' -> '" + commitStr + "'");
+                LOTUS_DEBUG("Macro expansion: '" + oldPreBuffer_ + "' -> '" + commitStr + "'");
                 // Try uinput replacement first, fallback to deleteSurroundingText, then plain commit
                 if (uinput_client_fd_ >= 0 && !oldPreBuffer_.empty()) {
                     performReplacement(oldPreBuffer_, commitStr);
@@ -1477,7 +1488,7 @@ namespace fcitx {
             }
         }
         if (needEngineReset.load() && realMode != LotusMode::Off) {
-            LOTUS_INFO("Need engine reset");
+            LOTUS_DEBUG("Need engine reset");
             oldPreBuffer_.clear();
             hasHistory_ = false;
             pending_initial_hold_timer_.reset();
@@ -1658,7 +1669,7 @@ namespace fcitx {
                 UniqueCPtr<char> commit(EnginePullCommit(lotusEngine_.handle()));
                 if (commit && (*commit.get() != 0)) {
                     ic_->commitString(commit.get());
-                    LOTUS_INFO("Commit: " + std::string(commit.get()));
+                    LOTUS_DEBUG("Commit: " + std::string(commit.get()));
                 }
             }
             if (!preserveUinputPreedit) {
@@ -1763,7 +1774,7 @@ namespace fcitx {
     }
 
     void LotusState::replayBufferedKeys() {
-        LOTUS_INFO("Starting replay buffered keys");
+        LOTUS_DEBUG("Starting replay buffered keys");
         if (buffered_keys_.empty()) {
             debugUinputTrace("replay_start empty");
             return;
@@ -1776,6 +1787,15 @@ namespace fcitx {
             uint32_t    state   = keys[i].state;
             std::string keyUtf8 = keySymToBufferedUtf8(sym);
             if (keyUtf8.empty()) {
+                continue;
+            }
+
+            if (isLiteralBraceKey(sym, state)) {
+                hasHistory_ = false;
+                ResetEngine(lotusEngine_.handle());
+                oldPreBuffer_.clear();
+                ic_->commitString(keyUtf8);
+                realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
                 continue;
             }
 
@@ -1878,6 +1898,6 @@ namespace fcitx {
                 realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
             }
         }
-        LOTUS_INFO("Replay buffered keys done");
+        LOTUS_DEBUG("Replay buffered keys done");
     }
 } // namespace fcitx

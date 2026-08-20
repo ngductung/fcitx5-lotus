@@ -268,7 +268,7 @@ namespace fcitx {
         if (old_fd != -1) {
             close(old_fd);
         }
-        LOTUS_INFO("Engine destroyed.");
+        LOTUS_DEBUG("Engine destroyed.");
     }
 
     const lotusCustomKeymap& LotusEngine::customKeymap() const {
@@ -395,10 +395,10 @@ namespace fcitx {
             instance_->inputContextManager().setPreeditEnabledByDefault(true);
 
         std::string appName = getProgramName(ic);
-        LOTUS_INFO("App name: " + appName);
+        LOTUS_DEBUG("App name: " + appName);
 
         const LotusMode targetMode = getAppRule(appName);
-        LOTUS_INFO("Target mode: " + LotusModeI18NAnnotation::toString(targetMode));
+        LOTUS_DEBUG("Target mode: " + LotusModeI18NAnnotation::toString(targetMode));
 
         updateCharsetAction(event.inputContext());
 
@@ -428,7 +428,7 @@ namespace fcitx {
                     if (appName.find(ackApp) != std::string::npos) {
                         if (is_dbus) {
                             state->waitAck_ = true;
-                            LOTUS_INFO(ackApp + " detected, waiting for ack");
+                            LOTUS_DEBUG(ackApp + " detected, waiting for ack");
                         }
                         state->wa_chromium_flag = true;
                         break;
@@ -437,7 +437,7 @@ namespace fcitx {
             }
         }
         if (event.type() == EventType::InputContextFocusIn && is_dbus && !surrvalid) {
-            LOTUS_INFO("Skip clearAllBuffers");
+            LOTUS_DEBUG("Skip clearAllBuffers");
         } else if (surrvalid && !state->oldPreBuffer_.empty() && (now_ms() - state->lastDeactivateTime_) < 100) {
             state->clearAllBuffers();
         }
@@ -568,7 +568,7 @@ namespace fcitx {
             }
 
             if (selectedMode != std::nullopt) {
-                LOTUS_INFO("Selected mode: " + LotusModeI18NAnnotation::toString(selectedMode.value()));
+                LOTUS_DEBUG("Selected mode: " + LotusModeI18NAnnotation::toString(selectedMode.value()));
                 if (selectedMode != LotusMode::Emoji) {
                     if (keySym == Key(*config_.shortcutDefault).sym()) { // Default Typing key
                         std::lock_guard<std::mutex> lock(appRulesMutex_);
@@ -606,7 +606,7 @@ namespace fcitx {
         }
 
         if (!keyEvent.isRelease() && !config_.cycleModeKey->empty() && keyEvent.key().checkKeyList(*config_.cycleModeKey)) {
-            LOTUS_INFO("Cycle mode key pressed");
+            LOTUS_DEBUG("Cycle mode key pressed");
             std::string                               appName  = getProgramName(ic);
             LotusMode                                 realMode = getAppRule(appName);
 
@@ -688,7 +688,7 @@ namespace fcitx {
         }
 
         if (!keyEvent.isRelease() && !config_.modeMenuKey->empty() && keyEvent.key().checkKeyList(*config_.modeMenuKey)) {
-            LOTUS_INFO("Mode menu key pressed");
+            LOTUS_DEBUG("Mode menu key pressed");
             currentConfigureApp_ = getProgramName(ic);
             g_mouse_clicked.store(false, std::memory_order_release);
             std::string appName = getProgramName(ic);
@@ -708,7 +708,7 @@ namespace fcitx {
     }
 
     void LotusEngine::reset(const InputMethodEntry& /*entry*/, InputContextEvent& event) {
-        LOTUS_INFO("Reset engine");
+        LOTUS_DEBUG("Reset engine");
         auto* state = event.inputContext()->propertyFor(&factory_);
         if (!state->isEmptyHistory() && event.type() != EventType::InputContextFocusOut) {
             return;
@@ -730,7 +730,7 @@ namespace fcitx {
         } else {
             if (event.type() == EventType::InputContextFocusOut && is_dbus && !surrvalid) {
                 state->lastDeactivateTime_ = now_ms();
-                LOTUS_INFO("Skip clearAllBuffers");
+                LOTUS_DEBUG("Skip clearAllBuffers");
             } else {
                 if (surrvalid && state->oldPreBuffer_.empty())
                     state->clearAllBuffers();

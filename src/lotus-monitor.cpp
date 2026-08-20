@@ -23,7 +23,7 @@ std::thread mouse_thread = std::thread();
 
 void        mousePressResetThread() {
     const std::string mouse_socket_path = buildSocketPath("mouse_socket");
-    LOTUS_INFO("Mouse press reset thread started.");
+    LOTUS_DEBUG("Mouse press reset thread started.");
 
     while (!stop_flag_monitor.load(std::memory_order_acquire)) {
         int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
@@ -45,7 +45,7 @@ void        mousePressResetThread() {
             sleep(1);
             continue;
         }
-        LOTUS_INFO("Mouse socket connected.");
+        LOTUS_DEBUG("Mouse socket connected.");
         mouse_socket_fd.store(sock, std::memory_order_release);
 
         struct pollfd pfd{};
