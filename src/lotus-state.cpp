@@ -29,10 +29,21 @@
 
 namespace fcitx {
     constexpr int      MAX_SCAN_LENGTH = 15;
+    constexpr uint64_t UINPUT_EMPTY_REPLACEMENT_FALLBACK_USEC = 110000;
+    constexpr uint64_t UINPUT_READY_CHECK_INITIAL_USEC        = 24000;
+    constexpr uint64_t UINPUT_READY_CHECK_INTERVAL_USEC       = 8000;
+    constexpr uint64_t UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC  = 43000;
 
     static inline bool isWordBreak(uint32_t ucs4) {
         // Space, tab, newline, carriage return, null, or punctuation/symbols (: ; < = > ? @)
         return ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= 58 && ucs4 <= 64);
+    }
+
+    static inline std::string keySymToBufferedUtf8(KeySym sym) {
+        if (sym == FcitxKey_space || sym == FcitxKey_KP_Space) {
+            return " ";
+        }
+        return Key::keySymToUTF8(sym);
     }
 
     LotusState::LotusState(LotusEngine* engine, InputContext* ic) : engine_(engine), ic_(ic) {
@@ -446,7 +457,19 @@ namespace fcitx {
         }
         if (isBackspace(currentSym)) {
             current_backspace_count_ += 1;
+            if (timer_driven_replacement_) {
+                if (realtextLen.load(std::memory_order_acquire) > 0) {
+                    realtextLen.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                if (current_backspace_count_ >= expected_backspaces_) {
+                    schedulePendingReplacementFallback(expected_backspaces_, true, realtextLen.load(std::memory_order_acquire), false, UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC);
+                }
+                return false;
+            }
             if (current_backspace_count_ < expected_backspaces_) {
+                if (realtextLen.load(std::memory_order_acquire) > 0) {
+                    realtextLen.fetch_sub(1, std::memory_order_acq_rel);
+                }
                 return false; // Allow intermediate backspaces to reach the app to clear autofill/old text.
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
@@ -464,39 +487,148 @@ namespace fcitx {
                     }
                 }
             }
-            ic_->commitString(pending_commit_string_);
-            LOTUS_INFO("Commit: " + pending_commit_string_);
-            expected_backspaces_     = 0;
-            current_backspace_count_ = 0;
-            pending_commit_string_.clear();
-
             event.filterAndAccept(); // Filter out the final trigger backspace.
-            is_deleting_.store(false);
-            replayBufferedKeys();
+            finishPendingReplacement(true);
             return true;
         }
         return false;
     }
 
-    void LotusState::performReplacement(const std::string& deletedPart, const std::string& addedPart) {
-        LOTUS_INFO("Perform replacement: " + deletedPart + " -> " + addedPart); //NOLINT
+    void LotusState::finishPendingReplacement(bool replayBuffered, bool resetTimer) {
+        if (resetTimer) {
+            pending_commit_fallback_timer_.reset();
+        }
 
-        if (performSurroundingReplacement(deletedPart, addedPart)) {
+        const auto commitString = pending_commit_string_;
+        if (!commitString.empty()) {
+            ic_->commitString(commitString);
+            LOTUS_INFO("Commit: " + commitString);
+            realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitString)), std::memory_order_acq_rel);
+        }
+
+        expected_backspaces_     = 0;
+        current_backspace_count_ = 0;
+        pending_commit_string_.clear();
+        timer_driven_replacement_ = false;
+        is_deleting_.store(false, std::memory_order_release);
+
+        if (replayBuffered) {
+            scheduleReplayBufferedKeys();
+        }
+    }
+
+    void LotusState::cancelPendingReplacement(bool replayBuffered, bool resetTimer) {
+        if (resetTimer) {
+            pending_commit_fallback_timer_.reset();
+        }
+        expected_backspaces_     = 0;
+        current_backspace_count_ = 0;
+        pending_commit_string_.clear();
+        timer_driven_replacement_ = false;
+        is_deleting_.store(false, std::memory_order_release);
+
+        if (replayBuffered) {
+            scheduleReplayBufferedKeys();
+        }
+    }
+
+    void LotusState::scheduleReplayBufferedKeys() {
+        pending_replay_event_.reset();
+        if (buffered_keys_.empty()) {
             return;
         }
 
+        pending_replay_event_ = engine_->instance()->eventLoop().addPostEvent([this, icRef = ic_->watch()](EventSource*) {
+            if (auto* ic = icRef.get(); ic && ic->hasFocus()) {
+                replayBufferedKeys();
+            } else {
+                buffered_keys_.clear();
+            }
+            return false;
+        });
+    }
+
+    void LotusState::schedulePendingReplacementFallback(int deletedChars, bool requireBackspaceEvents, unsigned int targetCursor, bool allowEarlyReadyCheck, uint64_t fallbackUsec) {
+        pending_commit_fallback_timer_.reset();
+        if (deletedChars <= 0 || expected_backspaces_ < deletedChars) {
+            return;
+        }
+
+        const auto now      = ::fcitx::now(CLOCK_MONOTONIC);
+        const auto deadline = now + fallbackUsec;
+        const auto timeout  = now + (allowEarlyReadyCheck ? UINPUT_READY_CHECK_INITIAL_USEC : fallbackUsec);
+        pending_commit_fallback_timer_ =
+            engine_->instance()->eventLoop().addTimeEvent(CLOCK_MONOTONIC, timeout, 0, [this, icRef = ic_->watch(), deletedChars, requireBackspaceEvents, targetCursor, allowEarlyReadyCheck, deadline](EventSourceTime* source, uint64_t) {
+                if (!is_deleting_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                if (pending_commit_string_.empty()) {
+                    cancelPendingReplacement(true, false);
+                    return false;
+                }
+
+                const auto now = ::fcitx::now(CLOCK_MONOTONIC);
+                if (auto* ic = icRef.get(); !ic || !ic->hasFocus()) {
+                    if (now < deadline) {
+                        source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                        return true;
+                    }
+                    cancelPendingReplacement(false, false);
+                    return false;
+                }
+
+                if (requireBackspaceEvents && current_backspace_count_ < deletedChars) {
+                    if (now < deadline) {
+                        source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                        return true;
+                    }
+                    cancelPendingReplacement(true, false);
+                    return false;
+                }
+
+                bool ready = now >= deadline;
+                if (!ready && allowEarlyReadyCheck) {
+                    const auto& surr = ic_->surroundingText();
+                    ready = surr.isValid() && surr.cursor() == surr.anchor() && surr.cursor() == targetCursor;
+                }
+
+                if (!ready) {
+                    source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                    return true;
+                }
+
+                LOTUS_WARN("Fallback commit pending uinput replacement after missing trigger backspace");
+                finishPendingReplacement(true, false);
+                return false;
+            });
+    }
+
+    void LotusState::performReplacement(const std::string& deletedPart, const std::string& addedPart) {
+        LOTUS_INFO("Perform replacement: " + deletedPart + " -> " + addedPart); //NOLINT
         current_backspace_count_ = 0;
         pending_commit_string_   = addedPart;
-        expected_backspaces_     = static_cast<int>(utf8::length(deletedPart));
+        const auto deletedChars  = static_cast<int>(utf8::length(deletedPart));
+        int        realBackspaces = deletedChars;
+        timer_driven_replacement_ = (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth);
+        expected_backspaces_      = deletedChars;
+        const auto currentLen     = realtextLen.load(std::memory_order_acquire);
+        const auto targetCursor   = currentLen > static_cast<unsigned int>(deletedChars) ? currentLen - static_cast<unsigned int>(deletedChars) : 0U;
+        bool mayEmptyInput        = currentLen <= static_cast<unsigned int>(deletedChars);
         if (realMode != LotusMode::Minecraft) {
-            ++expected_backspaces_;
+            if (!timer_driven_replacement_) {
+                ++expected_backspaces_;
+            }
             if (realMode != LotusMode::SuperSmooth) {
                 const auto& surrounding = ic_->surroundingText();
+                if (surrounding.isValid() && surrounding.cursor() == surrounding.anchor() && surrounding.cursor() <= static_cast<unsigned int>(deletedChars)) {
+                    mayEmptyInput = true;
+                }
                 // Enable Autofill detection for all frontends (Wayland/IBus).
                 // This fixes the "toôi" duplication bug in Chromium-based search bars.
                 // The isAutofillCertain function has been optimized to differentiate
                 // between browser autofill and AI ghost text.
                 if (isAutofillCertain(surrounding)) {
+                    ++realBackspaces;
                     ++expected_backspaces_;
                 }
             }
@@ -507,45 +639,14 @@ namespace fcitx {
         }
 
         is_deleting_.store(true, std::memory_order_release);
+        if (timer_driven_replacement_) {
+            expected_backspaces_ = realBackspaces;
+            schedulePendingReplacementFallback(deletedChars, false, targetCursor, false, UINPUT_EMPTY_REPLACEMENT_FALLBACK_USEC);
+        } else if (mayEmptyInput && realMode != LotusMode::Minecraft) {
+            schedulePendingReplacementFallback(deletedChars, true, targetCursor, false, UINPUT_EMPTY_REPLACEMENT_FALLBACK_USEC);
+        }
         send_backspace_uinput(expected_backspaces_);
         LOTUS_INFO("Send " + std::to_string(expected_backspaces_) + " backspaces");
-    }
-
-    bool LotusState::performSurroundingReplacement(const std::string& deletedPart, const std::string& addedPart) {
-        if (deletedPart.empty() || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
-            return false;
-        }
-
-        const auto& surrounding = ic_->surroundingText();
-        if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor()) {
-            return false;
-        }
-
-        const size_t charsToDelete = utf8::length(deletedPart);
-        if (charsToDelete == 0 || surrounding.cursor() < charsToDelete) {
-            return false;
-        }
-
-        ic_->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
-        if (!addedPart.empty()) {
-            ic_->commitString(addedPart);
-            LOTUS_INFO("Commit: " + addedPart);
-        }
-
-        const auto oldLen = realtextLen.load(std::memory_order_acquire);
-        const auto addLen = static_cast<unsigned int>(utf8::length(addedPart));
-        const auto delLen = static_cast<unsigned int>(charsToDelete);
-        realtextLen.store(oldLen > delLen ? oldLen - delLen + addLen : addLen, std::memory_order_release);
-
-        expected_backspaces_     = 0;
-        current_backspace_count_ = 0;
-        pending_commit_string_.clear();
-        is_deleting_.store(false, std::memory_order_release);
-
-        if (!buffered_keys_.empty()) {
-            replayBufferedKeys();
-        }
-        return true;
     }
 
     bool LotusState::checkForwardSpecialKey(KeyEvent& keyEvent, KeySym& currentSym) {
@@ -555,6 +656,9 @@ namespace fcitx {
             expected_backspaces_     = 0;
             current_backspace_count_ = 0;
             pending_commit_string_.clear();
+            pending_commit_fallback_timer_.reset();
+            pending_replay_event_.reset();
+            timer_driven_replacement_ = false;
             hasHistory_ = false;
             ResetEngine(lotusEngine_.handle());
             oldPreBuffer_.clear();
@@ -1023,12 +1127,15 @@ namespace fcitx {
             LOTUS_WARN("Cannot connect to uinput server, reconnecting....");
             connect_uinput_server();
         }
-        if (current_backspace_count_ >= expected_backspaces_ && is_deleting_.load()) {
+        if (!timer_driven_replacement_ && expected_backspaces_ > 0 && current_backspace_count_ >= expected_backspaces_ && is_deleting_.load()) {
             is_deleting_.store(false);
             current_backspace_count_ = 0;
             expected_backspaces_     = 0;
+            pending_commit_fallback_timer_.reset();
+            pending_replay_event_.reset();
+            timer_driven_replacement_ = false;
             if (!buffered_keys_.empty()) {
-                replayBufferedKeys();
+                scheduleReplayBufferedKeys();
             }
         }
         if (needEngineReset.load() && realMode != LotusMode::Off) {
@@ -1091,13 +1198,11 @@ namespace fcitx {
 
         if (is_deleting_.load(std::memory_order_acquire)) {
             if (isBackspace(currentSym)) {
-                if (realtextLen.load(std::memory_order_acquire) > 0)
-                    realtextLen.fetch_sub(1, std::memory_order_acq_rel);
                 if (handleUInputKeyPress(keyEvent, currentSym, (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth) ? 5 : 20)) {
                     return;
                 }
             } else {
-                std::string keyUtf8Check = Key::keySymToUTF8(currentSym);
+                std::string keyUtf8Check = keySymToBufferedUtf8(currentSym);
                 if (!keyUtf8Check.empty() && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
                     LOTUS_WARN("Typing so fast, add key to queue");
                     buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states()});
@@ -1268,6 +1373,9 @@ namespace fcitx {
             expected_backspaces_     = 0;
             current_backspace_count_ = 0;
             pending_commit_string_.clear();
+            pending_commit_fallback_timer_.reset();
+            pending_replay_event_.reset();
+            timer_driven_replacement_ = false;
         }
         emojiBuffer_.clear();
         emojiCandidates_.clear();
@@ -1294,7 +1402,7 @@ namespace fcitx {
         for (size_t i = 0; i < keys.size(); ++i) {
             auto        sym     = static_cast<KeySym>(keys[i].sym);
             uint32_t    state   = keys[i].state;
-            std::string keyUtf8 = Key::keySymToUTF8(sym);
+            std::string keyUtf8 = keySymToBufferedUtf8(sym);
             if (keyUtf8.empty()) {
                 continue;
             }
@@ -1323,6 +1431,7 @@ namespace fcitx {
                 }
                 if (!addedPart.empty()) {
                     ic_->commitString(addedPart);
+                    realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_acq_rel);
                 }
 
                 hasHistory_ = false;
@@ -1333,11 +1442,12 @@ namespace fcitx {
 
             if (!processed) {
                 ic_->commitString(keyUtf8);
+                realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
                 continue;
             }
 
             hasHistory_ = true;
-            realtextLen.fetch_add(1, std::memory_order_acq_rel);
+            realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
 
             UniqueCPtr<char> preeditC(EnginePullPreedit(lotusEngine_.handle()));
             std::string      preeditStr = (preeditC && (*preeditC.get() != 0)) ? preeditC.get() : "";
@@ -1372,6 +1482,8 @@ namespace fcitx {
                     oldPreBuffer_ = preeditStr;
                     return;
                 }
+            } else {
+                ic_->commitString(keyUtf8);
             }
         }
         LOTUS_INFO("Replay buffered keys done");

@@ -20,6 +20,7 @@
 #include "lotus-utils.h"
 
 #include <cstddef>
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/misc.h>
 #include <fcitx/inputcontext.h>
 
@@ -95,6 +96,9 @@ namespace fcitx {
         int                     expected_backspaces_     = 0;
         int                     current_backspace_count_ = 0;
         std::string             pending_commit_string_;
+        std::unique_ptr<EventSourceTime> pending_commit_fallback_timer_;
+        std::unique_ptr<EventSource>     pending_replay_event_;
+        bool                    timer_driven_replacement_ = false;
         std::string             emojiBuffer_;
         std::vector<EmojiEntry> emojiCandidates_;
         bool                    waitAck_ = false;
@@ -165,19 +169,40 @@ namespace fcitx {
         bool handleUInputKeyPress(KeyEvent& event, KeySym currentSym, int sleepTime);
 
         /**
+         * @brief Commits a pending uinput replacement and clears its state.
+         * @param replayBufferedKeys If true, buffered fast-typed keys are replayed.
+         * @param resetTimer If true, cancels the fallback timer.
+         */
+        void finishPendingReplacement(bool replayBufferedKeys, bool resetTimer = true);
+
+        /**
+         * @brief Clears a pending replacement that cannot be committed safely.
+         * @param replayBufferedKeys If true, buffered fast-typed keys are replayed.
+         * @param resetTimer If true, cancels the fallback timer.
+         */
+        void cancelPendingReplacement(bool replayBufferedKeys, bool resetTimer = true);
+
+        /**
+         * @brief Schedules buffered key replay outside the current key/timer callback.
+         */
+        void scheduleReplayBufferedKeys();
+
+        /**
+         * @brief Schedules a fallback commit when a generated trigger backspace may be lost.
+         * @param deletedChars Number of real characters that must be deleted first.
+         * @param requireBackspaceEvents If true, waits until generated backspace events are observed.
+         * @param targetCursor Expected cursor position after real backspaces are applied.
+         * @param allowEarlyReadyCheck If true, commits before fallback when surrounding text confirms deletion.
+         * @param fallbackUsec Maximum wait before committing or canceling.
+         */
+        void schedulePendingReplacementFallback(int deletedChars, bool requireBackspaceEvents, unsigned int targetCursor, bool allowEarlyReadyCheck, uint64_t fallbackUsec);
+
+        /**
          * @brief Performs text replacement via uinput.
          * @param deletedPart Text to delete.
          * @param addedPart Text to insert.
          */
         void performReplacement(const std::string& deletedPart, const std::string& addedPart);
-
-        /**
-         * @brief Performs replacement via surrounding text when the frontend supports it.
-         * @param deletedPart Text to delete.
-         * @param addedPart Text to insert.
-         * @return True if replacement was applied without uinput backspaces.
-         */
-        bool performSurroundingReplacement(const std::string& deletedPart, const std::string& addedPart);
 
         /**
          * @brief Handles the double space to period replacement.

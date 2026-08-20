@@ -82,8 +82,8 @@ int compareAndSplitStrings(const std::string& A, const std::string& B, std::stri
         }
     }
 
-    deletedPart.assign(A, i);
-    addedPart.assign(B, j);
+    deletedPart.assign(A, i, std::string::npos);
+    addedPart.assign(B, j, std::string::npos);
     return (deletedPart.empty() && addedPart.empty()) ? 1 : 2;
 }
 

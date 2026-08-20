@@ -264,8 +264,10 @@ int main(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
 
+    constexpr int BACKSPACE_INTERVAL_MS = 16;
+
     while (g_running.load(std::memory_order_acquire)) {
-        int poll_timeout = (pending_backspaces > 0) ? 1 : -1;
+        int poll_timeout = (pending_backspaces > 0) ? BACKSPACE_INTERVAL_MS : -1;
         int ret          = poll(fds.data(), fds.size(), poll_timeout);
 
         if (ret < 0) {
@@ -334,8 +336,7 @@ int main(int argc, char* argv[]) {
                 kb_client_fd.reset(-1);
                 fds[KB_CLIENT_INDEX].fd = -1;
             } else {
-                pending_backspaces += count - 1;
-                uinput.send_backspace();
+                pending_backspaces += count;
             }
         }
 
