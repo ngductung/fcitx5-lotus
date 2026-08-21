@@ -21,3 +21,14 @@
  * Chromium-based browsers that need special handling for text replacement.
  */
 static std::vector<std::string> ack_apps = {"chrome", "chromium", "brave", "edge", "vivaldi", "opera", "coccoc", "cromite", "helium", "thorium", "slimjet", "yandex"};
+
+/**
+ * @brief List of application names that should receive committed text directly.
+ *
+ * These applications become visually choppy when normal typing is forwarded
+ * and then rewritten with uinput backspaces.
+ */
+static std::vector<std::string> direct_commit_apps = {"chrome",                "chromium", "brave",          "edge",    "vivaldi", "opera", "coccoc",
+                                                      "cromite",               "helium",   "thorium",        "slimjet", "yandex",  "viber", "viberpc",
+                                                      "gnome-terminal-server", "kgx",      "konsole",        "tilix",   "alacritty",
+                                                      "kitty",                 "wezterm",  "org.wezfurlong", "foot",    "xterm"};

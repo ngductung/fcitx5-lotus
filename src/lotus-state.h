@@ -113,6 +113,7 @@ namespace fcitx {
         bool                    isPrevPunctuation_  = false;
         int64_t                 lastDeactivateTime_ = 0;
         bool                    wa_chromium_flag    = false;
+        bool                    trust_unvalidated_surrounding_delete_ = false;
 
         /**
          * @brief Connects to the uinput server.

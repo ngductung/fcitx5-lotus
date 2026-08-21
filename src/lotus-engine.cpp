@@ -39,6 +39,19 @@ namespace fcitx {
     const std::string     CustomKeymapFile    = "conf/lotus-custom-keymap.conf";
     const std::string     MacroTableFile      = "conf/lotus-macro-table.conf";
 
+    static inline bool isAnonymousIbusContext(InputContext* ic) {
+        return ic != nullptr && ic->program().empty() && getFrontendName(ic) == "ibus";
+    }
+
+    static inline bool isViberProgramName(std::string appName) {
+#if __cplusplus >= 202002L
+        std::ranges::transform(appName, appName.begin(), ::tolower);
+#else
+        std::transform(appName.begin(), appName.end(), appName.begin(), ::tolower);
+#endif
+        return appName.find("viber") != std::string::npos || appName.find("viberpc") != std::string::npos;
+    }
+
     int                   modeToInt(LotusMode mode) {
         switch (mode) {
             case LotusMode::Off: return 0;
@@ -415,22 +428,38 @@ namespace fcitx {
         //
         // TODO: Properly fixes instead ugly WA
         state->wa_chromium_flag = false;
+        state->trust_unvalidated_surrounding_delete_ = false;
 
         state->waitAck_ = false;
-        if (*config_.fixUinputWithAck) {
-            if (targetMode == LotusMode::Uinput || targetMode == LotusMode::Smooth || targetMode == LotusMode::Minecraft || targetMode == LotusMode::SuperSmooth) {
+        if (targetMode == LotusMode::Uinput || targetMode == LotusMode::Smooth || targetMode == LotusMode::Minecraft || targetMode == LotusMode::SuperSmooth) {
+            std::string lowerAppName = appName;
 #if __cplusplus >= 202002L
-                std::ranges::transform(appName, appName.begin(), ::tolower);
+            std::ranges::transform(lowerAppName, lowerAppName.begin(), ::tolower);
 #else
-                std::transform(appName.begin(), appName.end(), appName.begin(), ::tolower);
+            std::transform(lowerAppName.begin(), lowerAppName.end(), lowerAppName.begin(), ::tolower);
 #endif
+            for (const auto& directCommitApp : direct_commit_apps) {
+                if (lowerAppName.find(directCommitApp) != std::string::npos) {
+                    state->wa_chromium_flag = true;
+                    LOTUS_DEBUG(directCommitApp + " detected, direct commit workaround enabled");
+                    break;
+                }
+            }
+            if (isViberProgramName(lowerAppName) || isViberProgramName(ic->program())) {
+                state->trust_unvalidated_surrounding_delete_ = true;
+                LOTUS_DEBUG("viber detected, trusting unvalidated surrounding delete requests");
+            }
+            if (isAnonymousIbusContext(ic)) {
+                state->wa_chromium_flag = true;
+                LOTUS_DEBUG("anonymous ibus context detected, direct commit workaround enabled");
+            }
+            if (*config_.fixUinputWithAck) {
                 for (const auto& ackApp : ack_apps) {
-                    if (appName.find(ackApp) != std::string::npos) {
+                    if (lowerAppName.find(ackApp) != std::string::npos) {
                         if (is_dbus) {
                             state->waitAck_ = true;
                             LOTUS_DEBUG(ackApp + " detected, waiting for ack");
                         }
-                        state->wa_chromium_flag = true;
                         break;
                     }
                 }

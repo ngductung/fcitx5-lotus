@@ -34,7 +34,8 @@ namespace fcitx {
     constexpr uint64_t UINPUT_READY_CHECK_INITIAL_USEC        = 24000;
     constexpr uint64_t UINPUT_READY_CHECK_INTERVAL_USEC       = 8000;
     constexpr uint64_t UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC  = 43000;
-    constexpr uint64_t UINPUT_INITIAL_HOLD_USEC               = 24000;
+    constexpr uint64_t UINPUT_TERMINAL_BACKSPACE_COMMIT_USEC = 8000;
+    constexpr uint64_t UINPUT_INITIAL_HOLD_USEC              = 24000;
     constexpr bool     UINPUT_HOLD_INITIAL_PREEDIT            = true;
 
     static inline bool isWordBreak(uint32_t ucs4) {
@@ -61,6 +62,39 @@ namespace fcitx {
         std::string keyUtf8 = Key::keySymToUTF8(sym);
         return keyUtf8 == "{" || keyUtf8 == "}" ||
                ((state & static_cast<uint32_t>(KeyState::Shift)) != 0U && (sym == FcitxKey_bracketleft || sym == FcitxKey_bracketright));
+    }
+
+    static inline bool isEnterKey(KeySym sym) {
+        return sym == FcitxKey_Return || sym == FcitxKey_KP_Enter;
+    }
+
+    static inline bool shouldBufferPendingUinputKey(KeySym sym) {
+        return !keySymToBufferedUtf8(sym).empty() || isEnterKey(sym);
+    }
+
+    static inline void forwardCurrentKeyDirect(KeyEvent& keyEvent) {
+        keyEvent.filterAndAccept();
+        keyEvent.inputContext()->forwardKey(keyEvent.rawKey(), false, keyEvent.time());
+    }
+
+    static inline void replayBufferedSpecialKey(InputContext* ic, KeySym sym, uint32_t state) {
+        Key key(sym, KeyStates(state));
+        ic->forwardKey(key);
+        ic->forwardKey(key, true);
+    }
+
+    static inline bool isAnonymousIbusContext(InputContext* ic) {
+        return ic != nullptr && ic->program().empty() && getFrontendName(ic) == "ibus";
+    }
+
+    static inline bool isTerminalProgram(std::string appName) {
+#if __cplusplus >= 202002L
+        std::ranges::transform(appName, appName.begin(), ::tolower);
+#else
+        std::transform(appName.begin(), appName.end(), appName.begin(), ::tolower);
+#endif
+        return appName.find("terminal") != std::string::npos || appName.find("konsole") != std::string::npos || appName.find("alacritty") != std::string::npos ||
+               appName.find("kitty") != std::string::npos || appName.find("wezterm") != std::string::npos || appName == "kgx" || appName == "foot" || appName == "xterm";
     }
 
     static inline constexpr bool isUinputDebugEnabled() {
@@ -530,7 +564,11 @@ namespace fcitx {
                     realtextLen.fetch_sub(1, std::memory_order_acq_rel);
                 }
                 if (current_backspace_count_ >= expected_backspaces_) {
-                    if (pending_replacement_may_empty_input_) {
+                    if (isTerminalProgram(ic_->program())) {
+                        debugUinputTrace("observed_all_backspaces schedule_terminal_commit_delay_usec=" + std::to_string(UINPUT_TERMINAL_BACKSPACE_COMMIT_USEC));
+                        schedulePendingReplacementFallback(expected_backspaces_, true, realtextLen.load(std::memory_order_acquire), false,
+                                                           UINPUT_TERMINAL_BACKSPACE_COMMIT_USEC);
+                    } else if (pending_replacement_may_empty_input_) {
                         debugUinputTrace("observed_all_backspaces keep_empty_input_fallback_usec=" + std::to_string(UINPUT_EMPTY_REPLACEMENT_FALLBACK_USEC));
                     } else {
                         debugUinputTrace("observed_all_backspaces schedule_commit_delay_usec=" + std::to_string(UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC));
@@ -822,7 +860,7 @@ namespace fcitx {
             debugUinputTrace(oss.str());
         }
 
-        if (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth) {
+        if (realMode == LotusMode::SuperSmooth) {
             std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
 
@@ -942,7 +980,11 @@ namespace fcitx {
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
             }
-            keyEvent.forward();
+            if (currentSym == FcitxKey_Return) {
+                forwardCurrentKeyDirect(keyEvent);
+            } else {
+                keyEvent.forward();
+            }
             return;
         }
 
@@ -981,7 +1023,7 @@ namespace fcitx {
         }
         const bool canHoldInitialUinput =
             UINPUT_HOLD_INITIAL_PREEDIT && !wasHoldingInitial && (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth) && oldPreBuffer_.empty() &&
-            canHoldInitialUinputKey(currentSym);
+            canHoldInitialUinputKey(currentSym) && !wa_chromium_flag;
 
         if (isUinputDebugEnabled()) {
             std::ostringstream oss;
@@ -989,6 +1031,47 @@ namespace fcitx {
                 << " realLen=" << realtextLen.load(std::memory_order_acquire) << " canHoldInitial=" << canHoldInitialUinput << " wasHoldingInitial=" << wasHoldingInitial;
             debugUinputTrace(oss.str());
         }
+        auto replaceWithSurroundingRequest = [this](const std::string& deletedPart, const std::string& addedPart) {
+            auto deletedChars = static_cast<int>(utf8::length(deletedPart));
+            if (deletedChars <= 0 || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                return false;
+            }
+
+            const auto& surrounding = ic_->surroundingText();
+            const auto  surrTextLen = surrounding.isValid() ? utf8::length(surrounding.text()) : 0;
+            const bool  trustUnvalidatedDeleteRequest = trust_unvalidated_surrounding_delete_;
+            auto currentLen = realtextLen.load(std::memory_order_acquire);
+            if (!trustUnvalidatedDeleteRequest) {
+                if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor() || surrounding.cursor() < static_cast<unsigned int>(deletedChars)) {
+                    return false;
+                }
+
+                if (surrTextLen < surrounding.cursor()) {
+                    return false;
+                }
+
+                auto deleteStart = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor() - static_cast<unsigned int>(deletedChars));
+                auto deleteEnd   = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor());
+                if (std::string(deleteStart, deleteEnd) != deletedPart) {
+                    return false;
+                }
+            }
+
+            ic_->deleteSurroundingText(-deletedChars, deletedChars);
+            if (!addedPart.empty()) {
+                ic_->commitString(addedPart);
+            }
+
+            auto removedLen = static_cast<unsigned int>(deletedChars);
+            if (currentLen >= removedLen) {
+                currentLen -= removedLen;
+            } else {
+                currentLen = 0;
+            }
+            currentLen += static_cast<unsigned int>(utf8::length(addedPart));
+            realtextLen.store(currentLen, std::memory_order_release);
+            return true;
+        };
         bool processed = EngineProcessKeyEvent(lotusEngine_.handle(), currentSym, keyEvent.rawKey().states()) != 0U;
 
         auto commitF = UniqueCPtr<char>(EnginePullCommit(lotusEngine_.handle()));
@@ -1033,8 +1116,12 @@ namespace fcitx {
             }
 
             if (!deletedPart.empty()) {
-                performReplacement(deletedPart, addedPart);
-                keyEvent.filterAndAccept();
+                if (wa_chromium_flag && replaceWithSurroundingRequest(deletedPart, addedPart)) {
+                    keyEvent.filterAndAccept();
+                } else {
+                    performReplacement(deletedPart, addedPart);
+                    keyEvent.filterAndAccept();
+                }
             } else {
                 bool wasAutoCapitalized = (currentSym != keyEvent.rawKey().sym());
                 if (!addedPart.empty() && (keyUtf8 != addedPart || wasAutoCapitalized)) {
@@ -1162,6 +1249,12 @@ namespace fcitx {
                     realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
                 }
             } else {
+                if (wa_chromium_flag && replaceWithSurroundingRequest(deletedPart, addedPart)) {
+                    oldPreBuffer_ = preeditStr;
+                    hasHistory_   = true;
+                    return;
+                }
+
                 if (uinput_client_fd_ < 0) {
                     LOTUS_ERROR("Cannot connect to uinput server, commit rawkey");
                     std::string rawKey = keyEvent.key().toString();
@@ -1507,10 +1600,16 @@ namespace fcitx {
             clearAllBuffers();
         }
         KeySym currentSym = keyEvent.rawKey().sym();
+        const bool anonymousIbusDirectCommit = isAnonymousIbusContext(ic_) &&
+                                               (realMode == LotusMode::Uinput || realMode == LotusMode::Smooth || realMode == LotusMode::Minecraft ||
+                                                realMode == LotusMode::SuperSmooth);
+        if (anonymousIbusDirectCommit) {
+            wa_chromium_flag = true;
+            waitAck_         = false;
+        }
         if (pending_replay_scheduled_) {
-            std::string keyUtf8Check = keySymToBufferedUtf8(currentSym);
-            if (!keyUtf8Check.empty() && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
-                debugUinputTrace("buffer_key_while_replay_pending sym=" + std::to_string(currentSym) + " key='" + keyUtf8Check + "'");
+            if (shouldBufferPendingUinputKey(currentSym) && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
+                debugUinputTrace("buffer_key_while_replay_pending sym=" + std::to_string(currentSym) + " key='" + keySymToBufferedUtf8(currentSym) + "'");
                 buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states()});
                 keyEvent.filterAndAccept();
                 return;
@@ -1562,9 +1661,8 @@ namespace fcitx {
                     return;
                 }
             } else {
-                std::string keyUtf8Check = keySymToBufferedUtf8(currentSym);
-                if (!keyUtf8Check.empty() && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
-                    LOTUS_WARN("Typing so fast, add key to queue");
+                if (shouldBufferPendingUinputKey(currentSym) && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
+                    LOTUS_DEBUG("Typing so fast, add key to queue");
                     buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states()});
                 }
                 keyEvent.filterAndAccept();
@@ -1787,6 +1885,13 @@ namespace fcitx {
             uint32_t    state   = keys[i].state;
             std::string keyUtf8 = keySymToBufferedUtf8(sym);
             if (keyUtf8.empty()) {
+                if (isEnterKey(sym)) {
+                    flushHeldInitialUinput();
+                    hasHistory_ = false;
+                    ResetEngine(lotusEngine_.handle());
+                    oldPreBuffer_.clear();
+                    replayBufferedSpecialKey(ic_, sym, state);
+                }
                 continue;
             }
 
