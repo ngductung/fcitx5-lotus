@@ -1605,6 +1605,9 @@ namespace fcitx {
                                                 realMode == LotusMode::SuperSmooth);
         if (anonymousIbusDirectCommit) {
             wa_chromium_flag = true;
+            if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                trust_unvalidated_surrounding_delete_ = true;
+            }
             waitAck_         = false;
         }
         if (pending_replay_scheduled_) {

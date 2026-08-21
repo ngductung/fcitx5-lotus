@@ -446,11 +446,15 @@ namespace fcitx {
                 }
             }
             if (isViberProgramName(lowerAppName) || isViberProgramName(ic->program())) {
+                state->wa_chromium_flag = true;
                 state->trust_unvalidated_surrounding_delete_ = true;
-                LOTUS_DEBUG("viber detected, trusting unvalidated surrounding delete requests");
+                LOTUS_DEBUG("viber detected, direct commit workaround enabled");
             }
             if (isAnonymousIbusContext(ic)) {
                 state->wa_chromium_flag = true;
+                if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                    state->trust_unvalidated_surrounding_delete_ = true;
+                }
                 LOTUS_DEBUG("anonymous ibus context detected, direct commit workaround enabled");
             }
             if (*config_.fixUinputWithAck) {
