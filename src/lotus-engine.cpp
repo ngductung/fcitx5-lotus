@@ -452,7 +452,7 @@ namespace fcitx {
             }
             if (isAnonymousIbusContext(ic)) {
                 state->wa_chromium_flag = true;
-                if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText) && !ic->surroundingText().isValid()) {
                     state->trust_unvalidated_surrounding_delete_ = true;
                 }
                 LOTUS_DEBUG("anonymous ibus context detected, direct commit workaround enabled");

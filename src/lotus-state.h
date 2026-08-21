@@ -102,6 +102,7 @@ namespace fcitx {
         bool                    timer_driven_replacement_ = false;
         bool                    pending_replacement_may_empty_input_ = false;
         bool                    holding_initial_uinput_preedit_ = false;
+        bool                    pending_reset_engine_after_commit_ = false;
         bool                    pending_replay_scheduled_ = false;
         std::string             emojiBuffer_;
         std::vector<EmojiEntry> emojiCandidates_;

@@ -97,6 +97,38 @@ namespace fcitx {
                appName.find("kitty") != std::string::npos || appName.find("wezterm") != std::string::npos || appName == "kgx" || appName == "foot" || appName == "xterm";
     }
 
+    static inline constexpr bool shouldDebugAnonymousIbus(InputContext*) {
+        return false;
+    }
+
+    static inline bool canDeleteBeforeCursorWithSelection(const SurroundingText& surrounding) {
+        if (!surrounding.isValid()) {
+            return false;
+        }
+        if (surrounding.cursor() == surrounding.anchor()) {
+            return true;
+        }
+
+        const unsigned int cursor = surrounding.cursor();
+        const unsigned int anchor = surrounding.anchor();
+        if (cursor >= anchor) {
+            return false;
+        }
+
+        const auto& text = surrounding.text();
+        const auto  textLen = utf8::length(text);
+        if (anchor > textLen) {
+            return false;
+        }
+
+        auto selectedStart = utf8::nextNChar(text.begin(), cursor);
+        auto selectedEnd = utf8::nextNChar(text.begin(), anchor);
+        return std::find(selectedStart, selectedEnd, '\n') == selectedEnd;
+    }
+
+    static inline void debugAnonymousIbusTrace(const std::string&) {
+    }
+
     static inline constexpr bool isUinputDebugEnabled() {
         return false;
     }
@@ -553,6 +585,12 @@ namespace fcitx {
         }
         if (isBackspace(currentSym)) {
             current_backspace_count_ += 1;
+            if (shouldDebugAnonymousIbus(ic_)) {
+                std::ostringstream oss;
+                oss << "observed_backspace count=" << current_backspace_count_ << "/" << expected_backspaces_ << " timer=" << timer_driven_replacement_
+                    << " realLen=" << realtextLen.load(std::memory_order_acquire) << " pending='" << pending_commit_string_ << "'";
+                debugAnonymousIbusTrace(oss.str());
+            }
             if (isUinputDebugEnabled()) {
                 std::ostringstream oss;
                 oss << "observed_backspace count=" << current_backspace_count_ << "/" << expected_backspaces_ << " timer=" << timer_driven_replacement_
@@ -609,8 +647,14 @@ namespace fcitx {
         if (resetTimer) {
             pending_commit_fallback_timer_.reset();
         }
-
         const auto commitString = pending_commit_string_;
+        if (shouldDebugAnonymousIbus(ic_)) {
+            std::ostringstream oss;
+            oss << "finish_pending commit='" << commitString << "' replay=" << replayBuffered << " resetTimer=" << resetTimer
+                << " resetEngine=" << pending_reset_engine_after_commit_ << " realLenBefore=" << realtextLen.load(std::memory_order_acquire)
+                << " buffered=" << buffered_keys_.size();
+            debugAnonymousIbusTrace(oss.str());
+        }
         if (isUinputDebugEnabled()) {
             std::ostringstream oss;
             oss << "finish_pending commit='" << commitString << "' replay=" << replayBuffered << " resetTimer=" << resetTimer << " realLenBefore="
@@ -622,6 +666,11 @@ namespace fcitx {
             LOTUS_DEBUG("Commit: " + commitString);
             realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitString)), std::memory_order_acq_rel);
         }
+        if (pending_reset_engine_after_commit_) {
+            hasHistory_ = false;
+            ResetEngine(lotusEngine_.handle());
+            oldPreBuffer_.clear();
+        }
 
         expected_backspaces_     = 0;
         current_backspace_count_ = 0;
@@ -630,6 +679,7 @@ namespace fcitx {
         pending_replacement_may_empty_input_ = false;
         pending_initial_hold_timer_.reset();
         holding_initial_uinput_preedit_ = false;
+        pending_reset_engine_after_commit_ = false;
         is_deleting_.store(false, std::memory_order_release);
 
         if (replayBuffered) {
@@ -654,6 +704,7 @@ namespace fcitx {
         pending_replacement_may_empty_input_ = false;
         pending_initial_hold_timer_.reset();
         holding_initial_uinput_preedit_ = false;
+        pending_reset_engine_after_commit_ = false;
         is_deleting_.store(false, std::memory_order_release);
 
         if (replayBuffered) {
@@ -822,7 +873,8 @@ namespace fcitx {
             }
         }
 
-        bool canReplaceWithSurrounding = timer_driven_replacement_ && realMode != LotusMode::Minecraft && surrValid && surrCursor == surrAnchor &&
+        const bool canDeleteBeforeCursor = canDeleteBeforeCursorWithSelection(ic_->surroundingText());
+        bool canReplaceWithSurrounding = timer_driven_replacement_ && realMode != LotusMode::Minecraft && surrValid && canDeleteBeforeCursor &&
                                          surrCursor >= static_cast<unsigned int>(deletedChars) && surrTextLen >= surrCursor;
         if (canReplaceWithSurrounding) {
             const auto& surrounding = ic_->surroundingText();
@@ -832,6 +884,12 @@ namespace fcitx {
         }
 
         if (canReplaceWithSurrounding) {
+            if (shouldDebugAnonymousIbus(ic_)) {
+                std::ostringstream oss;
+                oss << "performReplacement surrounding deleted='" << deletedPart << "' added='" << addedPart << "' cursor=" << surrCursor << " anchor=" << surrAnchor
+                    << " textLen=" << surrTextLen << " trust=" << trust_unvalidated_surrounding_delete_;
+                debugAnonymousIbusTrace(oss.str());
+            }
             if (isUinputDebugEnabled()) {
                 std::ostringstream oss;
                 oss << "surrounding_replace_in_smooth deleted='" << deletedPart << "' added='" << addedPart << "' cursor=" << surrCursor << " deletedChars=" << deletedChars;
@@ -848,7 +906,17 @@ namespace fcitx {
             pending_commit_string_.clear();
             timer_driven_replacement_ = false;
             pending_replacement_may_empty_input_ = false;
+            pending_reset_engine_after_commit_ = false;
             return;
+        }
+
+        if (shouldDebugAnonymousIbus(ic_)) {
+            std::ostringstream oss;
+            oss << "performReplacement fallback_uinput deleted='" << deletedPart << "' added='" << addedPart << "' deletedChars=" << deletedChars << " currentLen=" << currentLen
+                << " targetCursor=" << targetCursor << " mayEmptyInput=" << mayEmptyInput << " timer=" << timer_driven_replacement_ << " expected=" << expected_backspaces_
+                << " realBackspaces=" << realBackspaces << " surrValid=" << surrValid << " surrCursor=" << surrCursor << " surrAnchor=" << surrAnchor << " surrTextLen="
+                << surrTextLen << " wa=" << wa_chromium_flag << " trust=" << trust_unvalidated_surrounding_delete_;
+            debugAnonymousIbusTrace(oss.str());
         }
 
         if (isUinputDebugEnabled()) {
@@ -889,6 +957,7 @@ namespace fcitx {
             pending_initial_hold_timer_.reset();
             timer_driven_replacement_ = false;
             pending_replacement_may_empty_input_ = false;
+            pending_reset_engine_after_commit_ = false;
             holding_initial_uinput_preedit_ = false;
             hasHistory_ = false;
             ResetEngine(lotusEngine_.handle());
@@ -1034,34 +1103,78 @@ namespace fcitx {
         auto replaceWithSurroundingRequest = [this](const std::string& deletedPart, const std::string& addedPart) {
             auto deletedChars = static_cast<int>(utf8::length(deletedPart));
             if (deletedChars <= 0 || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                if (shouldDebugAnonymousIbus(ic_)) {
+                    std::ostringstream oss;
+                    oss << "direct_surrounding skip_basic deleted='" << deletedPart << "' added='" << addedPart << "' deletedChars=" << deletedChars << " capSurr="
+                        << ic_->capabilityFlags().test(CapabilityFlag::SurroundingText);
+                    debugAnonymousIbusTrace(oss.str());
+                }
                 return false;
             }
 
             const auto& surrounding = ic_->surroundingText();
             const auto  surrTextLen = surrounding.isValid() ? utf8::length(surrounding.text()) : 0;
             const bool  trustUnvalidatedDeleteRequest = trust_unvalidated_surrounding_delete_;
+            const bool  replaceFirstCharWithForwardSelection =
+                !trustUnvalidatedDeleteRequest && surrounding.isValid() && surrounding.cursor() < surrounding.anchor() &&
+                surrounding.cursor() == static_cast<unsigned int>(deletedChars) && !addedPart.empty();
             auto currentLen = realtextLen.load(std::memory_order_acquire);
             if (!trustUnvalidatedDeleteRequest) {
-                if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor() || surrounding.cursor() < static_cast<unsigned int>(deletedChars)) {
+                if (!canDeleteBeforeCursorWithSelection(surrounding) || surrounding.cursor() < static_cast<unsigned int>(deletedChars)) {
+                    if (shouldDebugAnonymousIbus(ic_)) {
+                        std::ostringstream oss;
+                        oss << "direct_surrounding skip_validate deleted='" << deletedPart << "' added='" << addedPart << "' surrValid=" << surrounding.isValid()
+                            << " cursor=" << surrounding.cursor() << " anchor=" << surrounding.anchor() << " textLen=" << surrTextLen << " trust="
+                            << trustUnvalidatedDeleteRequest;
+                        debugAnonymousIbusTrace(oss.str());
+                    }
                     return false;
                 }
 
                 if (surrTextLen < surrounding.cursor()) {
+                    if (shouldDebugAnonymousIbus(ic_)) {
+                        debugAnonymousIbusTrace("direct_surrounding skip_text_len");
+                    }
                     return false;
                 }
 
                 auto deleteStart = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor() - static_cast<unsigned int>(deletedChars));
                 auto deleteEnd   = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor());
                 if (std::string(deleteStart, deleteEnd) != deletedPart) {
+                    if (shouldDebugAnonymousIbus(ic_)) {
+                        std::ostringstream oss;
+                        oss << "direct_surrounding skip_mismatch deleted='" << deletedPart << "'";
+                        debugAnonymousIbusTrace(oss.str());
+                    }
                     return false;
                 }
             }
 
-            ic_->deleteSurroundingText(-deletedChars, deletedChars);
-            if (!addedPart.empty()) {
-                ic_->commitString(addedPart);
+            if (shouldDebugAnonymousIbus(ic_)) {
+                std::ostringstream oss;
+                oss << "direct_surrounding apply deleted='" << deletedPart << "' added='" << addedPart << "' trust=" << trustUnvalidatedDeleteRequest
+                    << " surrValid=" << surrounding.isValid() << " cursor=" << surrounding.cursor() << " anchor=" << surrounding.anchor() << " textLen=" << surrTextLen
+                    << " currentLen=" << currentLen << " replaceFirstSelection=" << replaceFirstCharWithForwardSelection;
+                debugAnonymousIbusTrace(oss.str());
             }
-
+            if (replaceFirstCharWithForwardSelection) {
+                const int backspacesToSend = deletedChars + 1;
+                current_backspace_count_ = 0;
+                expected_backspaces_ = backspacesToSend;
+                pending_commit_string_ = addedPart;
+                timer_driven_replacement_ = true;
+                pending_replacement_may_empty_input_ = false;
+                pending_reset_engine_after_commit_ = true;
+                is_deleting_.store(true, std::memory_order_release);
+                schedulePendingReplacementFallback(backspacesToSend, false, 0, false, UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC);
+                if (shouldDebugAnonymousIbus(ic_)) {
+                    debugAnonymousIbusTrace("direct_surrounding first_selection_uinput_backspace deletedChars=" + std::to_string(deletedChars) +
+                                            " backspaces=" + std::to_string(backspacesToSend) + " added='" + addedPart + "'");
+                }
+                send_backspace_uinput(backspacesToSend);
+                return true;
+            }
+            ic_->deleteSurroundingText(-deletedChars, deletedChars);
             auto removedLen = static_cast<unsigned int>(deletedChars);
             if (currentLen >= removedLen) {
                 currentLen -= removedLen;
@@ -1069,6 +1182,10 @@ namespace fcitx {
                 currentLen = 0;
             }
             currentLen += static_cast<unsigned int>(utf8::length(addedPart));
+
+            if (!addedPart.empty()) {
+                ic_->commitString(addedPart);
+            }
             realtextLen.store(currentLen, std::memory_order_release);
             return true;
         };
@@ -1575,6 +1692,7 @@ namespace fcitx {
             pending_initial_hold_timer_.reset();
             timer_driven_replacement_ = false;
             pending_replacement_may_empty_input_ = false;
+            pending_reset_engine_after_commit_ = false;
             holding_initial_uinput_preedit_ = false;
             if (!buffered_keys_.empty()) {
                 scheduleReplayBufferedKeys();
@@ -1585,6 +1703,7 @@ namespace fcitx {
             oldPreBuffer_.clear();
             hasHistory_ = false;
             pending_initial_hold_timer_.reset();
+            pending_reset_engine_after_commit_ = false;
             holding_initial_uinput_preedit_ = false;
             ResetEngine(lotusEngine_.handle());
             is_deleting_.store(false);
@@ -1605,8 +1724,13 @@ namespace fcitx {
                                                 realMode == LotusMode::SuperSmooth);
         if (anonymousIbusDirectCommit) {
             wa_chromium_flag = true;
-            if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
-                trust_unvalidated_surrounding_delete_ = true;
+            trust_unvalidated_surrounding_delete_ = ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) && !ic_->surroundingText().isValid();
+            if (shouldDebugAnonymousIbus(ic_)) {
+                std::ostringstream oss;
+                oss << "keyEvent anonymous sym=" << currentSym << " key='" << keySymToBufferedUtf8(currentSym) << "' trust="
+                    << trust_unvalidated_surrounding_delete_ << " surrValid=" << ic_->surroundingText().isValid() << " cursor=" << ic_->surroundingText().cursor()
+                    << " anchor=" << ic_->surroundingText().anchor() << " realLen=" << realtextLen.load(std::memory_order_acquire) << " oldPre='" << oldPreBuffer_ << "'";
+                debugAnonymousIbusTrace(oss.str());
             }
             waitAck_         = false;
         }
@@ -1857,6 +1981,7 @@ namespace fcitx {
             pending_initial_hold_timer_.reset();
             timer_driven_replacement_ = false;
             pending_replacement_may_empty_input_ = false;
+            pending_reset_engine_after_commit_ = false;
             holding_initial_uinput_preedit_ = false;
         }
         emojiBuffer_.clear();
