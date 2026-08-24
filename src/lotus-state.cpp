@@ -1115,9 +1115,7 @@ namespace fcitx {
             const auto& surrounding = ic_->surroundingText();
             const auto  surrTextLen = surrounding.isValid() ? utf8::length(surrounding.text()) : 0;
             const bool  trustUnvalidatedDeleteRequest = trust_unvalidated_surrounding_delete_;
-            const bool  replaceFirstCharWithForwardSelection =
-                !trustUnvalidatedDeleteRequest && surrounding.isValid() && surrounding.cursor() < surrounding.anchor() &&
-                surrounding.cursor() == static_cast<unsigned int>(deletedChars) && !addedPart.empty();
+            const bool  replaceWithForwardSelection = !trustUnvalidatedDeleteRequest && surrounding.isValid() && surrounding.cursor() < surrounding.anchor() && !addedPart.empty();
             auto currentLen = realtextLen.load(std::memory_order_acquire);
             if (!trustUnvalidatedDeleteRequest) {
                 if (!canDeleteBeforeCursorWithSelection(surrounding) || surrounding.cursor() < static_cast<unsigned int>(deletedChars)) {
@@ -1154,10 +1152,10 @@ namespace fcitx {
                 std::ostringstream oss;
                 oss << "direct_surrounding apply deleted='" << deletedPart << "' added='" << addedPart << "' trust=" << trustUnvalidatedDeleteRequest
                     << " surrValid=" << surrounding.isValid() << " cursor=" << surrounding.cursor() << " anchor=" << surrounding.anchor() << " textLen=" << surrTextLen
-                    << " currentLen=" << currentLen << " replaceFirstSelection=" << replaceFirstCharWithForwardSelection;
+                    << " currentLen=" << currentLen << " replaceForwardSelection=" << replaceWithForwardSelection;
                 debugAnonymousIbusTrace(oss.str());
             }
-            if (replaceFirstCharWithForwardSelection) {
+            if (replaceWithForwardSelection) {
                 const int backspacesToSend = deletedChars + 1;
                 current_backspace_count_ = 0;
                 expected_backspaces_ = backspacesToSend;
@@ -1168,7 +1166,7 @@ namespace fcitx {
                 is_deleting_.store(true, std::memory_order_release);
                 schedulePendingReplacementFallback(backspacesToSend, false, 0, false, UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC);
                 if (shouldDebugAnonymousIbus(ic_)) {
-                    debugAnonymousIbusTrace("direct_surrounding first_selection_uinput_backspace deletedChars=" + std::to_string(deletedChars) +
+                    debugAnonymousIbusTrace("direct_surrounding forward_selection_uinput_backspace deletedChars=" + std::to_string(deletedChars) +
                                             " backspaces=" + std::to_string(backspacesToSend) + " added='" + addedPart + "'");
                 }
                 send_backspace_uinput(backspacesToSend);
