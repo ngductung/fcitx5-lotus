@@ -1127,7 +1127,7 @@ namespace fcitx {
         realMode = mode;
         if (ic != nullptr) {
             if (auto* state = ic->propertyFor(&factory_)) {
-                state->clearAllBuffers();
+                state->clearAllBuffers(true);
             }
             ic->updateUserInterface(UserInterfaceComponent::StatusArea);
         }

@@ -31,4 +31,4 @@ static std::vector<std::string> ack_apps = {"chrome", "chromium", "brave", "edge
 static std::vector<std::string> direct_commit_apps = {"chrome",                "chromium", "brave",          "edge",    "vivaldi", "opera", "coccoc",
                                                       "cromite",               "helium",   "thorium",        "slimjet", "yandex",  "viber", "viberpc",
                                                       "gnome-terminal-server", "kgx",      "konsole",        "tilix",   "alacritty",
-                                                      "kitty",                 "wezterm",  "org.wezfurlong", "foot",    "xterm"};
+                                                      "kitty",                 "wezterm",  "org.wezfurlong", "foot",    "xterm",  "telegram"};

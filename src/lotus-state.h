@@ -75,7 +75,7 @@ namespace fcitx {
         /**
          * @brief Clears all internal buffers.
          */
-        void clearAllBuffers();
+        void clearAllBuffers(bool force = false);
 
         /**
          * @brief Checks if history buffer is empty.
@@ -115,6 +115,7 @@ namespace fcitx {
         int64_t                 lastDeactivateTime_ = 0;
         bool                    wa_chromium_flag    = false;
         bool                    trust_unvalidated_surrounding_delete_ = false;
+        bool                    suppress_surrounding_seed_once_ = false;
 
         /**
          * @brief Connects to the uinput server.

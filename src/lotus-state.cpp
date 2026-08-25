@@ -40,8 +40,12 @@ namespace fcitx {
 
     static inline bool isWordBreak(uint32_t ucs4) {
         // Match Bamboo's punctuation-as-word-break behavior for surrounding-text rebuilds.
-        return ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= '!' && ucs4 <= '/') ||
+        return ucs4 == 0xFFFC || ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= '!' && ucs4 <= '/') ||
                (ucs4 >= '0' && ucs4 <= '9') || (ucs4 >= ':' && ucs4 <= '@') || (ucs4 >= '[' && ucs4 <= '`') || (ucs4 >= '{' && ucs4 <= '~');
+    }
+
+    static inline bool containsObjectReplacementChar(const std::string& text) {
+        return text.find("\xEF\xBF\xBC") != std::string::npos;
     }
 
     static inline std::string keySymToBufferedUtf8(KeySym sym) {
@@ -124,6 +128,27 @@ namespace fcitx {
         auto selectedStart = utf8::nextNChar(text.begin(), cursor);
         auto selectedEnd = utf8::nextNChar(text.begin(), anchor);
         return std::find(selectedStart, selectedEnd, '\n') == selectedEnd;
+    }
+
+    static inline bool surroundingTextBeforeCursorEndsWith(const SurroundingText& surrounding, const std::string& suffix) {
+        if (!surrounding.isValid() || suffix.empty()) {
+            return false;
+        }
+
+        const auto suffixLen = utf8::length(suffix);
+        const auto cursor = surrounding.cursor();
+        if (cursor < suffixLen) {
+            return false;
+        }
+
+        const auto& text = surrounding.text();
+        if (utf8::length(text) < cursor) {
+            return false;
+        }
+
+        auto start = utf8::nextNChar(text.begin(), cursor - suffixLen);
+        auto end = utf8::nextNChar(text.begin(), cursor);
+        return std::string(start, end) == suffix;
     }
 
     static inline void debugAnonymousIbusTrace(const std::string&) {
@@ -680,6 +705,7 @@ namespace fcitx {
         pending_initial_hold_timer_.reset();
         holding_initial_uinput_preedit_ = false;
         pending_reset_engine_after_commit_ = false;
+        suppress_surrounding_seed_once_ = false;
         is_deleting_.store(false, std::memory_order_release);
 
         if (replayBuffered) {
@@ -705,6 +731,7 @@ namespace fcitx {
         pending_initial_hold_timer_.reset();
         holding_initial_uinput_preedit_ = false;
         pending_reset_engine_after_commit_ = false;
+        suppress_surrounding_seed_once_ = false;
         is_deleting_.store(false, std::memory_order_release);
 
         if (replayBuffered) {
@@ -1037,10 +1064,14 @@ namespace fcitx {
                 flushHeldInitialUinput();
             }
             if (isBackspace(currentSym)) {
-                hasHistory_ = true;
                 EngineProcessKeyEvent(lotusEngine_.handle(), FcitxKey_BackSpace, 0);
                 UniqueCPtr<char> preeditC(EnginePullPreedit(lotusEngine_.handle()));
                 oldPreBuffer_ = (preeditC && (*preeditC.get() != 0)) ? preeditC.get() : "";
+                hasHistory_ = !oldPreBuffer_.empty();
+                if (oldPreBuffer_.empty()) {
+                    suppress_surrounding_seed_once_ = true;
+                    ResetEngine(lotusEngine_.handle());
+                }
                 if (realtextLen.load(std::memory_order_acquire) > 0) {
                     realtextLen.fetch_sub(1, std::memory_order_acq_rel);
                 }
@@ -1074,7 +1105,9 @@ namespace fcitx {
             return;
         }
 
-        if (oldPreBuffer_.empty()) {
+        if (oldPreBuffer_.empty() && suppress_surrounding_seed_once_) {
+            suppress_surrounding_seed_once_ = false;
+        } else if (oldPreBuffer_.empty()) {
             std::string oldWord = previousWordFromSurrounding(ic_->surroundingText());
             if (!oldWord.empty()) {
                 EngineRebuildFromText(lotusEngine_.handle(), oldWord.c_str());
@@ -1102,7 +1135,7 @@ namespace fcitx {
         }
         auto replaceWithSurroundingRequest = [this](const std::string& deletedPart, const std::string& addedPart) {
             auto deletedChars = static_cast<int>(utf8::length(deletedPart));
-            if (deletedChars <= 0 || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+            if (deletedChars <= 0 || containsObjectReplacementChar(deletedPart) || !ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
                 if (shouldDebugAnonymousIbus(ic_)) {
                     std::ostringstream oss;
                     oss << "direct_surrounding skip_basic deleted='" << deletedPart << "' added='" << addedPart << "' deletedChars=" << deletedChars << " capSurr="
@@ -1231,6 +1264,19 @@ namespace fcitx {
             }
 
             if (!deletedPart.empty()) {
+                if (containsObjectReplacementChar(deletedPart)) {
+                    ResetEngine(lotusEngine_.handle());
+                    oldPreBuffer_.clear();
+                    hasHistory_ = false;
+                    if (wa_chromium_flag) {
+                        ic_->commitString(keyUtf8);
+                        keyEvent.filterAndAccept();
+                    } else {
+                        keyEvent.forward();
+                    }
+                    realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
+                    return;
+                }
                 if (wa_chromium_flag && replaceWithSurroundingRequest(deletedPart, addedPart)) {
                     keyEvent.filterAndAccept();
                 } else {
@@ -1364,6 +1410,19 @@ namespace fcitx {
                     realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
                 }
             } else {
+                if (containsObjectReplacementChar(deletedPart)) {
+                    ResetEngine(lotusEngine_.handle());
+                    oldPreBuffer_.clear();
+                    hasHistory_ = false;
+                    if (wa_chromium_flag) {
+                        ic_->commitString(keyUtf8);
+                        keyEvent.filterAndAccept();
+                    } else {
+                        keyEvent.forward();
+                    }
+                    realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
+                    return;
+                }
                 if (wa_chromium_flag && replaceWithSurroundingRequest(deletedPart, addedPart)) {
                     oldPreBuffer_ = preeditStr;
                     hasHistory_   = true;
@@ -1413,6 +1472,9 @@ namespace fcitx {
 
         if (isBackspace(keyEvent.rawKey().sym())) {
             ResetEngine(lotusEngine_.handle());
+            oldPreBuffer_.clear();
+            hasHistory_ = false;
+            suppress_surrounding_seed_once_ = true;
             keyEvent.forward();
             return;
         }
@@ -1485,6 +1547,11 @@ namespace fcitx {
             std::string deletedPart;
             std::string addedPart;
             compareAndSplitStrings(oldWord, newWord, deletedPart, addedPart);
+            if (containsObjectReplacementChar(deletedPart)) {
+                ResetEngine(lotusEngine_.handle());
+                keyEvent.forward();
+                return;
+            }
             if ((deletedPart.empty() || deletedPart == oldWord) && addedPart == keyEvent.key().toString()) {
                 ResetEngine(lotusEngine_.handle());
                 keyEvent.forward();
@@ -1732,6 +1799,32 @@ namespace fcitx {
             }
             waitAck_         = false;
         }
+        if (isEnterKey(currentSym) && (is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_)) {
+            pending_commit_fallback_timer_.reset();
+            pending_replay_event_.reset();
+            pending_replay_scheduled_ = false;
+            buffered_keys_.clear();
+
+            if (!pending_commit_string_.empty() && !surroundingTextBeforeCursorEndsWith(ic_->surroundingText(), pending_commit_string_)) {
+                ic_->commitString(pending_commit_string_);
+                realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(pending_commit_string_)), std::memory_order_acq_rel);
+            }
+
+            expected_backspaces_ = 0;
+            current_backspace_count_ = 0;
+            pending_commit_string_.clear();
+            timer_driven_replacement_ = false;
+            pending_replacement_may_empty_input_ = false;
+            pending_initial_hold_timer_.reset();
+            holding_initial_uinput_preedit_ = false;
+            pending_reset_engine_after_commit_ = false;
+            is_deleting_.store(false, std::memory_order_release);
+            hasHistory_ = false;
+            ResetEngine(lotusEngine_.handle());
+            oldPreBuffer_.clear();
+            forwardCurrentKeyDirect(keyEvent);
+            return;
+        }
         if (pending_replay_scheduled_) {
             if (shouldBufferPendingUinputKey(currentSym) && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
                 debugUinputTrace("buffer_key_while_replay_pending sym=" + std::to_string(currentSym) + " key='" + keySymToBufferedUtf8(currentSym) + "'");
@@ -1962,26 +2055,34 @@ namespace fcitx {
         }
     }
 
-    void LotusState::clearAllBuffers() {
+    void LotusState::clearAllBuffers(bool force) {
         LOTUS_DEBUG("Clear all buffers");
-        if (is_deleting_.load(std::memory_order_acquire)) {
+        if (!force && is_deleting_.load(std::memory_order_acquire)) {
             return;
+        }
+        if (force) {
+            is_deleting_.store(false, std::memory_order_release);
+            const auto& surrounding = ic_->surroundingText();
+            if (surrounding.isValid() && surrounding.cursor() == surrounding.anchor()) {
+                realtextLen.store(surrounding.cursor(), std::memory_order_release);
+            } else {
+                realtextLen.store(0, std::memory_order_release);
+            }
         }
         oldPreBuffer_.clear();
         hasHistory_ = false;
-        if (!is_deleting_.load(std::memory_order_acquire)) {
-            expected_backspaces_     = 0;
-            current_backspace_count_ = 0;
-            pending_commit_string_.clear();
-            pending_commit_fallback_timer_.reset();
-            pending_replay_event_.reset();
-            pending_replay_scheduled_ = false;
-            pending_initial_hold_timer_.reset();
-            timer_driven_replacement_ = false;
-            pending_replacement_may_empty_input_ = false;
-            pending_reset_engine_after_commit_ = false;
-            holding_initial_uinput_preedit_ = false;
-        }
+        expected_backspaces_     = 0;
+        current_backspace_count_ = 0;
+        pending_commit_string_.clear();
+        pending_commit_fallback_timer_.reset();
+        pending_replay_event_.reset();
+        pending_replay_scheduled_ = false;
+        pending_initial_hold_timer_.reset();
+        timer_driven_replacement_ = false;
+        pending_replacement_may_empty_input_ = false;
+        pending_reset_engine_after_commit_ = false;
+        holding_initial_uinput_preedit_ = false;
+        suppress_surrounding_seed_once_ = force;
         emojiBuffer_.clear();
         emojiCandidates_.clear();
         buffered_keys_.clear();
@@ -2009,15 +2110,17 @@ namespace fcitx {
         for (size_t i = 0; i < keys.size(); ++i) {
             auto        sym     = static_cast<KeySym>(keys[i].sym);
             uint32_t    state   = keys[i].state;
+            if (isEnterKey(sym)) {
+                flushHeldInitialUinput();
+                hasHistory_ = false;
+                ResetEngine(lotusEngine_.handle());
+                oldPreBuffer_.clear();
+                replayBufferedSpecialKey(ic_, sym, state);
+                continue;
+            }
+
             std::string keyUtf8 = keySymToBufferedUtf8(sym);
             if (keyUtf8.empty()) {
-                if (isEnterKey(sym)) {
-                    flushHeldInitialUinput();
-                    hasHistory_ = false;
-                    ResetEngine(lotusEngine_.handle());
-                    oldPreBuffer_.clear();
-                    replayBufferedSpecialKey(ic_, sym, state);
-                }
                 continue;
             }
 
