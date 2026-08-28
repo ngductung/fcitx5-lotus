@@ -21,6 +21,7 @@
 #include <fcitx/userinterface.h>
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -105,29 +106,39 @@ namespace fcitx {
         return false;
     }
 
-    static inline bool canDeleteBeforeCursorWithSelection(const SurroundingText& surrounding) {
-        if (!surrounding.isValid()) {
+    static inline bool deleteSurroundingTextBeforeCursorSafely(InputContext* ic, unsigned int charsToDelete, const std::string* expectedDeleted = nullptr) {
+        if (ic == nullptr || charsToDelete == 0 || charsToDelete > static_cast<unsigned int>(std::numeric_limits<int>::max()) ||
+            !ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
             return false;
         }
-        if (surrounding.cursor() == surrounding.anchor()) {
-            return true;
-        }
 
-        const unsigned int cursor = surrounding.cursor();
-        const unsigned int anchor = surrounding.anchor();
-        if (cursor >= anchor) {
+        const auto& surrounding = ic->surroundingText();
+        if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor()) {
             return false;
         }
 
         const auto& text = surrounding.text();
-        const auto  textLen = utf8::length(text);
-        if (anchor > textLen) {
+        const auto  textLen = utf8::lengthValidated(text);
+        const auto  cursor = surrounding.cursor();
+        if (textLen == utf8::INVALID_LENGTH || cursor > textLen || cursor < charsToDelete) {
             return false;
         }
 
-        auto selectedStart = utf8::nextNChar(text.begin(), cursor);
-        auto selectedEnd = utf8::nextNChar(text.begin(), anchor);
-        return std::find(selectedStart, selectedEnd, '\n') == selectedEnd;
+        auto actualStart = utf8::nextNChar(text.begin(), cursor - charsToDelete);
+        auto actualEnd = utf8::nextNChar(text.begin(), cursor);
+        std::string actualDeleted(actualStart, actualEnd);
+        if (containsObjectReplacementChar(actualDeleted)) {
+            return false;
+        }
+
+        if (expectedDeleted != nullptr) {
+            if (utf8::lengthValidated(*expectedDeleted) == utf8::INVALID_LENGTH || utf8::length(*expectedDeleted) != charsToDelete || actualDeleted != *expectedDeleted) {
+                return false;
+            }
+        }
+
+        ic->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+        return true;
     }
 
     static inline bool surroundingTextBeforeCursorEndsWith(const SurroundingText& surrounding, const std::string& suffix) {
@@ -883,7 +894,10 @@ namespace fcitx {
                 if (surrValid) {
                     surrCursor  = surrounding.cursor();
                     surrAnchor  = surrounding.anchor();
-                    surrTextLen = utf8::length(surrounding.text());
+                    surrTextLen = utf8::lengthValidated(surrounding.text());
+                    if (surrTextLen == utf8::INVALID_LENGTH) {
+                        surrValid = false;
+                    }
                 }
                 if (surrounding.isValid() && surrounding.cursor() == surrounding.anchor() && surrounding.cursor() <= static_cast<unsigned int>(deletedChars)) {
                     mayEmptyInput = true;
@@ -900,8 +914,7 @@ namespace fcitx {
             }
         }
 
-        const bool canDeleteBeforeCursor = canDeleteBeforeCursorWithSelection(ic_->surroundingText());
-        bool canReplaceWithSurrounding = timer_driven_replacement_ && realMode != LotusMode::Minecraft && surrValid && canDeleteBeforeCursor &&
+        bool canReplaceWithSurrounding = timer_driven_replacement_ && realMode != LotusMode::Minecraft && surrValid && surrCursor == surrAnchor &&
                                          surrCursor >= static_cast<unsigned int>(deletedChars) && surrTextLen >= surrCursor;
         if (canReplaceWithSurrounding) {
             const auto& surrounding = ic_->surroundingText();
@@ -922,19 +935,22 @@ namespace fcitx {
                 oss << "surrounding_replace_in_smooth deleted='" << deletedPart << "' added='" << addedPart << "' cursor=" << surrCursor << " deletedChars=" << deletedChars;
                 debugUinputTrace(oss.str());
             }
-            ic_->deleteSurroundingText(-deletedChars, deletedChars);
-            if (!addedPart.empty()) {
-                ic_->commitString(addedPart);
-                LOTUS_DEBUG("Commit: " + addedPart);
+            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart)) {
+                canReplaceWithSurrounding = false;
+            } else {
+                if (!addedPart.empty()) {
+                    ic_->commitString(addedPart);
+                    LOTUS_DEBUG("Commit: " + addedPart);
+                }
+                realtextLen.store((surrCursor - static_cast<unsigned int>(deletedChars)) + static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_release);
+                expected_backspaces_     = 0;
+                current_backspace_count_ = 0;
+                pending_commit_string_.clear();
+                timer_driven_replacement_ = false;
+                pending_replacement_may_empty_input_ = false;
+                pending_reset_engine_after_commit_ = false;
+                return;
             }
-            realtextLen.store((surrCursor - static_cast<unsigned int>(deletedChars)) + static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_release);
-            expected_backspaces_     = 0;
-            current_backspace_count_ = 0;
-            pending_commit_string_.clear();
-            timer_driven_replacement_ = false;
-            pending_replacement_may_empty_input_ = false;
-            pending_reset_engine_after_commit_ = false;
-            return;
         }
 
         if (shouldDebugAnonymousIbus(ic_)) {
@@ -1146,40 +1162,10 @@ namespace fcitx {
             }
 
             const auto& surrounding = ic_->surroundingText();
-            const auto  surrTextLen = surrounding.isValid() ? utf8::length(surrounding.text()) : 0;
+            const auto  surrTextLen = surrounding.isValid() ? utf8::lengthValidated(surrounding.text()) : 0;
             const bool  trustUnvalidatedDeleteRequest = trust_unvalidated_surrounding_delete_;
-            const bool  replaceWithForwardSelection = !trustUnvalidatedDeleteRequest && surrounding.isValid() && surrounding.cursor() < surrounding.anchor() && !addedPart.empty();
+            const bool  replaceWithForwardSelection = surrounding.isValid() && surrounding.cursor() < surrounding.anchor() && !addedPart.empty();
             auto currentLen = realtextLen.load(std::memory_order_acquire);
-            if (!trustUnvalidatedDeleteRequest) {
-                if (!canDeleteBeforeCursorWithSelection(surrounding) || surrounding.cursor() < static_cast<unsigned int>(deletedChars)) {
-                    if (shouldDebugAnonymousIbus(ic_)) {
-                        std::ostringstream oss;
-                        oss << "direct_surrounding skip_validate deleted='" << deletedPart << "' added='" << addedPart << "' surrValid=" << surrounding.isValid()
-                            << " cursor=" << surrounding.cursor() << " anchor=" << surrounding.anchor() << " textLen=" << surrTextLen << " trust="
-                            << trustUnvalidatedDeleteRequest;
-                        debugAnonymousIbusTrace(oss.str());
-                    }
-                    return false;
-                }
-
-                if (surrTextLen < surrounding.cursor()) {
-                    if (shouldDebugAnonymousIbus(ic_)) {
-                        debugAnonymousIbusTrace("direct_surrounding skip_text_len");
-                    }
-                    return false;
-                }
-
-                auto deleteStart = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor() - static_cast<unsigned int>(deletedChars));
-                auto deleteEnd   = utf8::nextNChar(surrounding.text().begin(), surrounding.cursor());
-                if (std::string(deleteStart, deleteEnd) != deletedPart) {
-                    if (shouldDebugAnonymousIbus(ic_)) {
-                        std::ostringstream oss;
-                        oss << "direct_surrounding skip_mismatch deleted='" << deletedPart << "'";
-                        debugAnonymousIbusTrace(oss.str());
-                    }
-                    return false;
-                }
-            }
 
             if (shouldDebugAnonymousIbus(ic_)) {
                 std::ostringstream oss;
@@ -1205,7 +1191,15 @@ namespace fcitx {
                 send_backspace_uinput(backspacesToSend);
                 return true;
             }
-            ic_->deleteSurroundingText(-deletedChars, deletedChars);
+            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart)) {
+                if (shouldDebugAnonymousIbus(ic_)) {
+                    std::ostringstream oss;
+                    oss << "direct_surrounding skip_unsafe_delete deleted='" << deletedPart << "' added='" << addedPart << "' surrValid=" << surrounding.isValid()
+                        << " cursor=" << surrounding.cursor() << " anchor=" << surrounding.anchor() << " textLen=" << surrTextLen;
+                    debugAnonymousIbusTrace(oss.str());
+                }
+                return false;
+            }
             auto removedLen = static_cast<unsigned int>(deletedChars);
             if (currentLen >= removedLen) {
                 currentLen -= removedLen;
@@ -1561,8 +1555,10 @@ namespace fcitx {
             if (!deletedPart.empty() || !addedPart.empty()) {
                 size_t charsToDelete = utf8::length(deletedPart);
 
-                if (charsToDelete > 0) {
-                    ic->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+                if (charsToDelete > 0 && !deleteSurroundingTextBeforeCursorSafely(ic, static_cast<unsigned int>(charsToDelete), &deletedPart)) {
+                    ResetEngine(lotusEngine_.handle());
+                    keyEvent.forward();
+                    return;
                 }
 
                 if (!addedPart.empty()) {
@@ -1609,9 +1605,13 @@ namespace fcitx {
     void LotusState::handleDoubleSpaceReplacement() {
         switch (realMode) {
             case LotusMode::SurroundingText: {
-                ic_->deleteSurroundingText(-1, 1);
-                ic_->commitString(". ");
-                LOTUS_DEBUG("Commit: . ");
+                const std::string deletedPart = " ";
+                if (deleteSurroundingTextBeforeCursorSafely(ic_, 1, &deletedPart)) {
+                    ic_->commitString(". ");
+                    LOTUS_DEBUG("Commit: . ");
+                } else {
+                    ic_->commitString(" ");
+                }
 
                 break;
             }
@@ -1632,9 +1632,13 @@ namespace fcitx {
         std::string emDash = "—";
         switch (realMode) {
             case LotusMode::SurroundingText: {
-                ic_->deleteSurroundingText(-1, 1);
-                ic_->commitString(emDash);
-                LOTUS_DEBUG("Commit: — (em-dash)");
+                const std::string deletedPart = "-";
+                if (deleteSurroundingTextBeforeCursorSafely(ic_, 1, &deletedPart)) {
+                    ic_->commitString(emDash);
+                    LOTUS_DEBUG("Commit: — (em-dash)");
+                } else {
+                    ic_->commitString("-");
+                }
                 break;
             }
             default: { // Uinput, Smooth, Preedit, etc.
@@ -1697,8 +1701,12 @@ namespace fcitx {
                     const auto& surrounding = ic_->surroundingText();
                     if (surrounding.isValid()) {
                         size_t oldLen = utf8::length(oldPreBuffer_);
-                        if (oldLen > 0) {
-                            ic_->deleteSurroundingText(-static_cast<int>(oldLen), static_cast<int>(oldLen));
+                        if (oldLen > 0 && !deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(oldLen), &oldPreBuffer_)) {
+                            ResetEngine(lotusEngine_.handle());
+                            oldPreBuffer_.clear();
+                            hasHistory_ = false;
+                            keyEvent.forward();
+                            return;
                         }
                         ic_->commitString(commitStr);
                     } else {
