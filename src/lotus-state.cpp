@@ -106,7 +106,22 @@ namespace fcitx {
         return false;
     }
 
-    static inline bool deleteSurroundingTextBeforeCursorSafely(InputContext* ic, unsigned int charsToDelete, const std::string* expectedDeleted = nullptr) {
+    static inline bool canUseTrustedUnvalidatedSurroundingDelete(InputContext* ic) {
+        if (ic == nullptr) {
+            return false;
+        }
+
+        auto frontend = getFrontendName(ic);
+#if __cplusplus >= 202002L
+        std::ranges::transform(frontend, frontend.begin(), ::tolower);
+#else
+        std::transform(frontend.begin(), frontend.end(), frontend.begin(), ::tolower);
+#endif
+        return !frontend.empty() && frontend.find("wayland") == std::string::npos;
+    }
+
+    static inline bool deleteSurroundingTextBeforeCursorSafely(InputContext* ic, unsigned int charsToDelete, const std::string* expectedDeleted = nullptr,
+                                                               bool allowTrustedUnvalidatedDelete = false) {
         if (ic == nullptr || charsToDelete == 0 || charsToDelete > static_cast<unsigned int>(std::numeric_limits<int>::max()) ||
             !ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
             return false;
@@ -114,6 +129,10 @@ namespace fcitx {
 
         const auto& surrounding = ic->surroundingText();
         if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor()) {
+            if (allowTrustedUnvalidatedDelete && canUseTrustedUnvalidatedSurroundingDelete(ic)) {
+                ic->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+                return true;
+            }
             return false;
         }
 
@@ -121,6 +140,10 @@ namespace fcitx {
         const auto  textLen = utf8::lengthValidated(text);
         const auto  cursor = surrounding.cursor();
         if (textLen == utf8::INVALID_LENGTH || cursor > textLen || cursor < charsToDelete) {
+            if (allowTrustedUnvalidatedDelete && canUseTrustedUnvalidatedSurroundingDelete(ic)) {
+                ic->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+                return true;
+            }
             return false;
         }
 
@@ -133,6 +156,10 @@ namespace fcitx {
 
         if (expectedDeleted != nullptr) {
             if (utf8::lengthValidated(*expectedDeleted) == utf8::INVALID_LENGTH || utf8::length(*expectedDeleted) != charsToDelete || actualDeleted != *expectedDeleted) {
+                if (allowTrustedUnvalidatedDelete && canUseTrustedUnvalidatedSurroundingDelete(ic)) {
+                    ic->deleteSurroundingText(-static_cast<int>(charsToDelete), static_cast<int>(charsToDelete));
+                    return true;
+                }
                 return false;
             }
         }
@@ -935,7 +962,7 @@ namespace fcitx {
                 oss << "surrounding_replace_in_smooth deleted='" << deletedPart << "' added='" << addedPart << "' cursor=" << surrCursor << " deletedChars=" << deletedChars;
                 debugUinputTrace(oss.str());
             }
-            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart)) {
+            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart, trust_unvalidated_surrounding_delete_)) {
                 canReplaceWithSurrounding = false;
             } else {
                 if (!addedPart.empty()) {
@@ -1191,7 +1218,7 @@ namespace fcitx {
                 send_backspace_uinput(backspacesToSend);
                 return true;
             }
-            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart)) {
+            if (!deleteSurroundingTextBeforeCursorSafely(ic_, static_cast<unsigned int>(deletedChars), &deletedPart, trustUnvalidatedDeleteRequest)) {
                 if (shouldDebugAnonymousIbus(ic_)) {
                     std::ostringstream oss;
                     oss << "direct_surrounding skip_unsafe_delete deleted='" << deletedPart << "' added='" << addedPart << "' surrValid=" << surrounding.isValid()
