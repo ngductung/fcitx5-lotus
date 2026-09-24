@@ -93,8 +93,8 @@ namespace fcitx {
         keyEvent.inputContext()->forwardKey(keyEvent.rawKey(), false, keyEvent.time());
     }
 
-    static inline void replayBufferedSpecialKey(InputContext* ic, KeySym sym, uint32_t state) {
-        Key key(sym, KeyStates(state));
+    static inline void replayBufferedSpecialKey(InputContext* ic, KeySym sym, uint32_t state, int code) {
+        Key key(sym, KeyStates(state), code);
         ic->forwardKey(key);
         ic->forwardKey(key, true);
     }
@@ -1885,14 +1885,23 @@ namespace fcitx {
         while (!direct_keys_.empty() && !direct_awaiting_ && !is_deleting_.load(std::memory_order_acquire)) {
             const auto entry = direct_keys_.front();
             direct_keys_.erase(direct_keys_.begin());
-            KeyEvent event(ic_, Key(static_cast<KeySym>(entry.sym), KeyStates(entry.state)));
+            KeyEvent event(ic_, Key(static_cast<KeySym>(entry.sym), KeyStates(entry.state), entry.code));
             if (isUinputDebugEnabled()) {
                 debugUinputTrace("direct_drain_key sym=" + std::to_string(entry.sym) + " left=" + std::to_string(direct_keys_.size()));
             }
             keyEvent(event);
             if (!event.filtered()) {
-                ic_->forwardKey(event.rawKey());
-                ic_->forwardKey(event.rawKey(), true);
+                const auto text = keySymToBufferedUtf8(event.rawKey().sym());
+                if (!text.empty() && !event.rawKey().states().testAny(KeyStates{KeyState::Ctrl, KeyState::Alt, KeyState::Super})) {
+                    // Plain text keys (space, digits...) are committed, not re-injected: that keeps
+                    // them ordered with our other commits and does not depend on forwardKey.
+                    ic_->commitString(text);
+                    realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(text)), std::memory_order_acq_rel);
+                    startDirectAwait();
+                } else {
+                    ic_->forwardKey(event.rawKey());
+                    ic_->forwardKey(event.rawKey(), true);
+                }
             }
         }
         direct_draining_ = false;
@@ -1921,7 +1930,7 @@ namespace fcitx {
         if (!direct_draining_ && !generatedBackspace && (direct_awaiting_ || !direct_keys_.empty())) {
             if (direct_keys_.size() < MAX_BUFFERED_KEYS) {
                 debugUinputTrace("direct_hold_key sym=" + std::to_string(sym));
-                direct_keys_.push_back({.sym = sym, .state = keyEvent.rawKey().states()});
+                direct_keys_.push_back({.sym = sym, .state = keyEvent.rawKey().states(), .code = keyEvent.rawKey().code()});
             }
             keyEvent.filterAndAccept();
             return;
@@ -2034,7 +2043,7 @@ namespace fcitx {
         if (pending_replay_scheduled_) {
             if (shouldBufferPendingUinputKey(currentSym) && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
                 debugUinputTrace("buffer_key_while_replay_pending sym=" + std::to_string(currentSym) + " key='" + keySymToBufferedUtf8(currentSym) + "'");
-                buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states()});
+                buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states(), .code = keyEvent.rawKey().code()});
                 keyEvent.filterAndAccept();
                 return;
             }
@@ -2087,7 +2096,7 @@ namespace fcitx {
             } else {
                 if (shouldBufferPendingUinputKey(currentSym) && buffered_keys_.size() < MAX_BUFFERED_KEYS) {
                     LOTUS_DEBUG("Typing so fast, add key to queue");
-                    buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states()});
+                    buffered_keys_.push_back({.sym = currentSym, .state = keyEvent.rawKey().states(), .code = keyEvent.rawKey().code()});
                 }
                 keyEvent.filterAndAccept();
             }
@@ -2331,7 +2340,7 @@ namespace fcitx {
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
                 suppress_surrounding_seed_once_ = true;
-                replayBufferedSpecialKey(ic_, sym, state);
+                replayBufferedSpecialKey(ic_, sym, state, keys[i].code);
                 continue;
             }
 

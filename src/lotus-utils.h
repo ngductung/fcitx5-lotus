@@ -107,6 +107,7 @@ void lotusTrace(const std::string& msg);
 struct KeyEntry {
     uint32_t sym;   ///< Key symbol
     uint32_t state; ///< Key state (modifiers)
+    int      code = 0; ///< Hardware keycode; gnome-shell drops forwarded keys without it
 };
 
 #endif // _FCITX5_LOTUS_UTILS_H_
