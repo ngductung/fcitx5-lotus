@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 // Global variables
 std::atomic<fcitx::LotusMode> realMode{fcitx::LotusMode::Smooth};
@@ -99,4 +101,26 @@ std::string getFrontendName(fcitx::InputContext* ic) {
         return "unknown";
     }
     return ic->frontend();
+}
+
+static FILE* lotusTraceFile() {
+    static FILE* file = [] {
+        const char* path = std::getenv("LOTUS_TRACE_FILE");
+        return (path != nullptr && *path != '\0') ? std::fopen(path, "a") : nullptr;
+    }();
+    return file;
+}
+
+bool lotusTraceEnabled() {
+    return lotusTraceFile() != nullptr;
+}
+
+void lotusTrace(const std::string& msg) {
+    FILE* file = lotusTraceFile();
+    if (file == nullptr) {
+        return;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(file, "%lld %s\n", static_cast<long long>(ms), msg.c_str());
+    std::fflush(file);
 }

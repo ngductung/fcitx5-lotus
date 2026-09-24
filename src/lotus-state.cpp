@@ -40,6 +40,10 @@ namespace fcitx {
     // Server paces generated backspaces at 16 ms each; never give up before they can all arrive.
     constexpr uint64_t UINPUT_SERVER_BACKSPACE_INTERVAL_USEC = 16000;
     constexpr uint64_t UINPUT_BACKSPACE_ARRIVAL_SLACK_USEC   = 60000;
+    // sd-event treats accuracy 0 as its 250 ms default, which makes these short timers fire far too late.
+    constexpr uint64_t UINPUT_TIMER_ACCURACY_USEC            = 1000;
+    constexpr uint64_t UINPUT_DIRECT_CONFIRM_POLL_USEC       = 2000;
+    constexpr uint64_t UINPUT_DIRECT_CONFIRM_TIMEOUT_USEC    = 30000;
     constexpr bool     UINPUT_HOLD_INITIAL_PREEDIT            = true;
 
     static inline bool isWordBreak(uint32_t ucs4) {
@@ -109,8 +113,8 @@ namespace fcitx {
                appName.find("kitty") != std::string::npos || appName.find("wezterm") != std::string::npos || appName == "kgx" || appName == "foot" || appName == "xterm";
     }
 
-    static inline constexpr bool shouldDebugAnonymousIbus(InputContext*) {
-        return false;
+    static inline bool shouldDebugAnonymousIbus(InputContext*) {
+        return lotusTraceEnabled();
     }
 
     static inline bool canUseTrustedUnvalidatedSurroundingDelete(InputContext* ic) {
@@ -196,15 +200,19 @@ namespace fcitx {
         return std::string(start, end) == suffix;
     }
 
-    static inline void debugAnonymousIbusTrace(const std::string&) {
+    static inline void debugAnonymousIbusTrace(const std::string& msg) {
+        lotusTrace(msg);
     }
 
-    static inline constexpr bool isUinputDebugEnabled() {
-        return false;
+    static inline bool isUinputDebugEnabled() {
+        return lotusTraceEnabled();
     }
 
-#define debugUinputTrace(msg) \
-    do {                      \
+#define debugUinputTrace(msg)      \
+    do {                           \
+        if (lotusTraceEnabled()) { \
+            lotusTrace(msg);       \
+        }                          \
     } while (false)
 
     static inline std::string previousWordFromSurrounding(const SurroundingText& surrounding) {
@@ -736,6 +744,7 @@ namespace fcitx {
             LOTUS_DEBUG("Commit: " + commitString);
             realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(commitString)), std::memory_order_acq_rel);
         }
+        const bool awaitCommit = !commitString.empty() && needsSerializedOutput();
         if (pending_reset_engine_after_commit_) {
             hasHistory_ = false;
             ResetEngine(lotusEngine_.handle());
@@ -753,6 +762,9 @@ namespace fcitx {
         // We just committed the word break ourselves; surrounding text may still show the previous word.
         suppress_surrounding_seed_once_ = oldPreBuffer_.empty() && endsWithWordBreak(commitString);
         is_deleting_.store(false, std::memory_order_release);
+        if (awaitCommit) {
+            startDirectAwait();
+        }
 
         if (replayBuffered) {
             scheduleReplayBufferedKeys();
@@ -787,6 +799,16 @@ namespace fcitx {
 
     void LotusState::scheduleReplayBufferedKeys() {
         pending_replay_event_.reset();
+        if (needsSerializedOutput()) {
+            // Replaying commits back-to-back would drop all but the last one; feed them one by one instead.
+            pending_replay_scheduled_ = false;
+            direct_keys_.insert(direct_keys_.begin(), buffered_keys_.begin(), buffered_keys_.end());
+            buffered_keys_.clear();
+            if (!direct_awaiting_) {
+                scheduleDirectDrain();
+            }
+            return;
+        }
         if (buffered_keys_.empty()) {
             pending_replay_scheduled_ = false;
             debugUinputTrace("schedule_replay skipped empty_buffer");
@@ -862,7 +884,7 @@ namespace fcitx {
         const auto deadline = now + fallbackUsec;
         const auto timeout  = now + (allowEarlyReadyCheck ? UINPUT_READY_CHECK_INITIAL_USEC : fallbackUsec);
         pending_commit_fallback_timer_ =
-            engine_->instance()->eventLoop().addTimeEvent(CLOCK_MONOTONIC, timeout, 0, [this, icRef = ic_->watch(), deletedChars, requireBackspaceEvents, targetCursor, allowEarlyReadyCheck, deadline](EventSourceTime* source, uint64_t) {
+            engine_->instance()->eventLoop().addTimeEvent(CLOCK_MONOTONIC, timeout, UINPUT_TIMER_ACCURACY_USEC, [this, icRef = ic_->watch(), deletedChars, requireBackspaceEvents, targetCursor, allowEarlyReadyCheck, deadline](EventSourceTime* source, uint64_t) {
                 if (!is_deleting_.load(std::memory_order_acquire)) {
                     debugUinputTrace("fallback_tick stop not_deleting");
                     return false;
@@ -877,6 +899,7 @@ namespace fcitx {
                 if (auto* ic = icRef.get(); !ic || !ic->hasFocus()) {
                     if (now < deadline) {
                         source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                        source->setOneShot();
                         return true;
                     }
                     if (ic && current_backspace_count_ >= deletedChars) {
@@ -893,6 +916,7 @@ namespace fcitx {
                 if (requireBackspaceEvents && current_backspace_count_ < deletedChars) {
                     if (now < deadline) {
                         source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                        source->setOneShot();
                         return true;
                     }
                     debugUinputTrace("fallback_tick cancel missing_backspace_events");
@@ -908,6 +932,7 @@ namespace fcitx {
 
                 if (!ready) {
                     source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
+                    source->setOneShot();
                     return true;
                 }
 
@@ -993,6 +1018,7 @@ namespace fcitx {
                     LOTUS_DEBUG("Commit: " + addedPart);
                 }
                 realtextLen.store((surrCursor - static_cast<unsigned int>(deletedChars)) + static_cast<unsigned int>(utf8::length(addedPart)), std::memory_order_release);
+                debugUinputTrace("surrounding_replace_done");
                 expected_backspaces_     = 0;
                 current_backspace_count_ = 0;
                 pending_commit_string_.clear();
@@ -1429,7 +1455,7 @@ namespace fcitx {
                         holding_initial_uinput_preedit_ = true;
                         pending_initial_hold_timer_.reset();
                         pending_initial_hold_timer_ = engine_->instance()->eventLoop().addTimeEvent(
-                            CLOCK_MONOTONIC, ::fcitx::now(CLOCK_MONOTONIC) + UINPUT_INITIAL_HOLD_USEC, 0, [this, icRef = ic_->watch()](EventSourceTime*, uint64_t) {
+                            CLOCK_MONOTONIC, ::fcitx::now(CLOCK_MONOTONIC) + UINPUT_INITIAL_HOLD_USEC, UINPUT_TIMER_ACCURACY_USEC, [this, icRef = ic_->watch()](EventSourceTime*, uint64_t) {
                                 if (auto* ic = icRef.get(); ic && ic->hasFocus()) {
                                     flushHeldInitialUinput(false);
                                 } else {
@@ -1804,9 +1830,110 @@ namespace fcitx {
         }
     }
 
+    bool LotusState::needsSerializedOutput() const {
+        return isAnonymousIbusContext(ic_) &&
+               (realMode == LotusMode::Uinput || realMode == LotusMode::Smooth || realMode == LotusMode::Minecraft || realMode == LotusMode::SuperSmooth);
+    }
+
+    void LotusState::startDirectAwait() {
+        direct_awaiting_ = true;
+        const auto& surr          = ic_->surroundingText();
+        const bool  snapValid     = surr.isValid();
+        std::string snapText      = surr.text();
+        const auto  snapCursor    = surr.cursor();
+        const auto  snapAnchor    = surr.anchor();
+        const auto  now           = ::fcitx::now(CLOCK_MONOTONIC);
+        const auto  deadline      = now + UINPUT_DIRECT_CONFIRM_TIMEOUT_USEC;
+        direct_await_deadline_    = deadline;
+        debugUinputTrace("direct_await_start");
+        direct_await_timer_ = engine_->instance()->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now + UINPUT_DIRECT_CONFIRM_POLL_USEC, UINPUT_TIMER_ACCURACY_USEC,
+            [this, icRef = ic_->watch(), snapValid, snapText = std::move(snapText), snapCursor, snapAnchor, deadline](EventSourceTime* source, uint64_t) {
+                if (!icRef.isValid()) {
+                    return false;
+                }
+                const auto& surr    = ic_->surroundingText();
+                const bool  changed = surr.isValid() != snapValid || surr.cursor() != snapCursor || surr.anchor() != snapAnchor || surr.text() != snapText;
+                if (!changed && ::fcitx::now(CLOCK_MONOTONIC) < deadline) {
+                    source->setNextInterval(UINPUT_DIRECT_CONFIRM_POLL_USEC);
+                    source->setOneShot();
+                    return true;
+                }
+                debugUinputTrace(std::string("direct_await_done changed=") + (changed ? "1" : "0"));
+                direct_awaiting_ = false;
+                scheduleDirectDrain();
+                return false;
+            });
+    }
+
+    void LotusState::scheduleDirectDrain() {
+        if (direct_draining_ || direct_keys_.empty()) {
+            return;
+        }
+        direct_drain_event_ = engine_->instance()->eventLoop().addPostEvent([this, icRef = ic_->watch()](EventSource*) {
+            if (auto* ic = icRef.get(); ic && ic->hasFocus()) {
+                drainDirectKeys();
+            } else {
+                direct_keys_.clear();
+            }
+            return false;
+        });
+    }
+
+    void LotusState::drainDirectKeys() {
+        direct_draining_ = true;
+        while (!direct_keys_.empty() && !direct_awaiting_ && !is_deleting_.load(std::memory_order_acquire)) {
+            const auto entry = direct_keys_.front();
+            direct_keys_.erase(direct_keys_.begin());
+            KeyEvent event(ic_, Key(static_cast<KeySym>(entry.sym), KeyStates(entry.state)));
+            if (isUinputDebugEnabled()) {
+                debugUinputTrace("direct_drain_key sym=" + std::to_string(entry.sym) + " left=" + std::to_string(direct_keys_.size()));
+            }
+            keyEvent(event);
+            if (!event.filtered()) {
+                ic_->forwardKey(event.rawKey());
+                ic_->forwardKey(event.rawKey(), true);
+            }
+        }
+        direct_draining_ = false;
+    }
+
     void LotusState::keyEvent(KeyEvent& keyEvent) {
         if (!lotusEngine_ || keyEvent.isRelease() || keyEvent.rawKey().isModifier())
             return;
+        if (!needsSerializedOutput()) {
+            processKeyEvent(keyEvent);
+            return;
+        }
+
+        // gnome-shell/mutter defers text-input "done" to idle and GTK keeps only the last commit_string
+        // before it, so a commit sent before the previous one is applied replaces it ("án" -> "n").
+        // Hold keys until the client has applied our last output, then feed them through in order.
+        const KeySym sym                 = keyEvent.rawKey().sym();
+        const bool   generatedBackspace  = is_deleting_.load(std::memory_order_acquire) && isBackspace(sym);
+        if (direct_awaiting_ && !direct_draining_ && ::fcitx::now(CLOCK_MONOTONIC) >= direct_await_deadline_ + UINPUT_DIRECT_CONFIRM_TIMEOUT_USEC) {
+            // Safety net: never keep keys hostage if the confirmation timer did not run.
+            debugUinputTrace("direct_await_expired");
+            direct_awaiting_ = false;
+            direct_await_timer_.reset();
+            drainDirectKeys();
+        }
+        if (!direct_draining_ && !generatedBackspace && (direct_awaiting_ || !direct_keys_.empty())) {
+            if (direct_keys_.size() < MAX_BUFFERED_KEYS) {
+                debugUinputTrace("direct_hold_key sym=" + std::to_string(sym));
+                direct_keys_.push_back({.sym = sym, .state = keyEvent.rawKey().states()});
+            }
+            keyEvent.filterAndAccept();
+            return;
+        }
+
+        processKeyEvent(keyEvent);
+        if (keyEvent.filtered() && !generatedBackspace && !is_deleting_.load(std::memory_order_acquire) && !pending_replay_scheduled_) {
+            startDirectAwait();
+        }
+    }
+
+    void LotusState::processKeyEvent(KeyEvent& keyEvent) {
         if (uinput_client_fd_ < 0) {
             LOTUS_WARN("Cannot connect to uinput server, reconnecting....");
             connect_uinput_server();
@@ -1827,7 +1954,7 @@ namespace fcitx {
                 scheduleReplayBufferedKeys();
             }
         }
-        const bool replacementInFlight = is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_;
+        const bool replacementInFlight = is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_ || direct_awaiting_ || !direct_keys_.empty();
         if ((needEngineReset.load() || g_mouse_clicked.load(std::memory_order_acquire)) && !replacementInFlight) {
             // The held letter was typed before the click; commit it instead of dropping it.
             flushHeldInitialUinput();
@@ -1853,6 +1980,16 @@ namespace fcitx {
             clearAllBuffers();
         }
         KeySym currentSym = keyEvent.rawKey().sym();
+        if (isUinputDebugEnabled()) {
+            const auto&        surr = ic_->surroundingText();
+            std::ostringstream oss;
+            oss << "key_event ic=" << ic_ << " prog='" << ic_->program() << "' fe=" << getFrontendName(ic_) << " sym=" << currentSym << " key='"
+                << keySymToBufferedUtf8(currentSym) << "' deleting=" << is_deleting_.load() << " bs=" << current_backspace_count_ << "/" << expected_backspaces_
+                << " pending='" << pending_commit_string_ << "' replayPending=" << pending_replay_scheduled_ << " buffered=" << buffered_keys_.size() << " oldPre='"
+                << oldPreBuffer_ << "' hold=" << holding_initial_uinput_preedit_ << " realLen=" << realtextLen.load() << " wa=" << wa_chromium_flag
+                << " surrValid=" << surr.isValid() << " cursor=" << surr.cursor() << " anchor=" << surr.anchor() << " surrText='" << surr.text() << "'";
+            debugUinputTrace(oss.str());
+        }
         const bool anonymousIbusDirectCommit = isAnonymousIbusContext(ic_) &&
                                                (realMode == LotusMode::Uinput || realMode == LotusMode::Smooth || realMode == LotusMode::Minecraft ||
                                                 realMode == LotusMode::SuperSmooth);
@@ -2025,7 +2162,7 @@ namespace fcitx {
         const auto& text        = surrounding.text();
         size_t      textLen     = utf8::length(text);
         realtextLen.store(textLen, std::memory_order_release);
-        if (is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_) {
+        if (is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_ || direct_awaiting_ || !direct_keys_.empty()) {
             return;
         }
 
@@ -2158,6 +2295,12 @@ namespace fcitx {
         emojiBuffer_.clear();
         emojiCandidates_.clear();
         buffered_keys_.clear();
+        if (!direct_draining_) {
+            direct_keys_.clear();
+            direct_awaiting_ = false;
+            direct_await_timer_.reset();
+            direct_drain_event_.reset();
+        }
         shouldCapitalize_  = false;
         isPrevSpace_       = false;
         isPrevHyphen_      = false;

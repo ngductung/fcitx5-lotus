@@ -397,6 +397,9 @@ namespace fcitx {
 
     void LotusEngine::activate(const InputMethodEntry& /*entry*/, InputContextEvent& event) {
         auto*                    ic        = event.inputContext();
+        if (lotusTraceEnabled()) {
+            lotusTrace("activate ic=" + std::to_string(reinterpret_cast<uintptr_t>(ic)) + " prog='" + ic->program() + "' event=" + std::to_string(static_cast<int>(event.type())));
+        }
         const bool               surrvalid = ic->surroundingText().isValid();
         const bool               is_dbus   = getFrontendName(ic) == "dbus";
         static std::atomic<bool> mouseThreadStarted{false};
@@ -742,6 +745,9 @@ namespace fcitx {
 
     void LotusEngine::reset(const InputMethodEntry& /*entry*/, InputContextEvent& event) {
         LOTUS_DEBUG("Reset engine");
+        if (lotusTraceEnabled()) {
+            lotusTrace("reset ic=" + std::to_string(reinterpret_cast<uintptr_t>(event.inputContext())) + " event=" + std::to_string(static_cast<int>(event.type())));
+        }
         auto* state = event.inputContext()->propertyFor(&factory_);
         if (!state->isEmptyHistory() && event.type() != EventType::InputContextFocusOut) {
             return;
@@ -754,6 +760,9 @@ namespace fcitx {
 
     void LotusEngine::deactivate(const InputMethodEntry& /*entry*/, InputContextEvent& event) {
         auto*      ic              = event.inputContext();
+        if (lotusTraceEnabled()) {
+            lotusTrace("deactivate ic=" + std::to_string(reinterpret_cast<uintptr_t>(ic)) + " event=" + std::to_string(static_cast<int>(event.type())));
+        }
         auto*      state           = ic->propertyFor(&factory_);
         const bool surrvalid       = ic->surroundingText().isValid();
         const bool is_dbus         = getFrontendName(ic) == "dbus";

@@ -118,6 +118,13 @@ namespace fcitx {
         bool                    wa_chromium_flag    = false;
         bool                    trust_unvalidated_surrounding_delete_ = false;
         bool                    suppress_surrounding_seed_once_ = false;
+        // Serialized output for gnome-shell (anonymous ibus) contexts, see keyEvent().
+        std::vector<KeyEntry>            direct_keys_; ///< Keys waiting until the previous output is applied
+        std::unique_ptr<EventSourceTime> direct_await_timer_;
+        std::unique_ptr<EventSource>     direct_drain_event_;
+        bool                             direct_awaiting_ = false;
+        uint64_t                         direct_await_deadline_ = 0;
+        bool                             direct_draining_ = false;
 
         /**
          * @brief Connects to the uinput server.
@@ -195,6 +202,32 @@ namespace fcitx {
          * @brief Schedules buffered key replay outside the current key/timer callback.
          */
         void scheduleReplayBufferedKeys();
+
+        /**
+         * @brief Processes one key event (keyEvent() handles output serialization around it).
+         * @param keyEvent The key event to process.
+         */
+        void processKeyEvent(KeyEvent& keyEvent);
+
+        /**
+         * @brief Whether output must be serialized because the client drops back-to-back commits.
+         */
+        bool needsSerializedOutput() const;
+
+        /**
+         * @brief Holds further keys until the client has applied the output just sent.
+         */
+        void startDirectAwait();
+
+        /**
+         * @brief Schedules processing of held keys outside the current callback.
+         */
+        void scheduleDirectDrain();
+
+        /**
+         * @brief Processes held keys until one of them produces output again.
+         */
+        void drainDirectKeys();
 
         /**
          * @brief Drops a stuck replacement on focus change unless its fallback timer will resolve it.

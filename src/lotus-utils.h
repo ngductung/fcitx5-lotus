@@ -91,6 +91,17 @@ bool isStartsWith(const std::string& str, const std::string& prefix);
 std::string getFrontendName(fcitx::InputContext* ic);
 
 /**
+ * @brief Whether uinput tracing is enabled (LOTUS_TRACE_FILE environment variable).
+ */
+bool lotusTraceEnabled();
+
+/**
+ * @brief Appends a timestamped line to the LOTUS_TRACE_FILE trace file.
+ * @param msg Trace message.
+ */
+void lotusTrace(const std::string& msg);
+
+/**
  * @brief Key event entry for replay buffer.
  */
 struct KeyEntry {
