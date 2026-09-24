@@ -19,6 +19,7 @@
 #include "emoji-entry.h"
 #include "lotus-utils.h"
 
+#include <atomic>
 #include <cstddef>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/misc.h>
@@ -93,6 +94,7 @@ namespace fcitx {
         CGoObject               lotusEngine_;
         std::string             oldPreBuffer_;
         bool                    hasHistory_              = false;
+        std::atomic<bool>       is_deleting_{false}; ///< Uinput replacement of this context is in flight
         int                     expected_backspaces_     = 0;
         int                     current_backspace_count_ = 0;
         std::string             pending_commit_string_;
@@ -193,6 +195,11 @@ namespace fcitx {
          * @brief Schedules buffered key replay outside the current key/timer callback.
          */
         void scheduleReplayBufferedKeys();
+
+        /**
+         * @brief Drops a stuck replacement on focus change unless its fallback timer will resolve it.
+         */
+        void releaseReplacementOnFocusChange();
 
         /**
          * @brief Commits a hidden initial uinput preedit when no fast transform follows.

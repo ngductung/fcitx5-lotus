@@ -9,6 +9,7 @@
 #include "lotus-server.h"
 #include "lotus-logger.h"
 
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -264,11 +265,19 @@ int main(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
 
-    constexpr int BACKSPACE_INTERVAL_MS = 16;
+    constexpr auto BACKSPACE_INTERVAL = std::chrono::milliseconds(16);
+    // Deadline for the next backspace. Other fds (libinput sees every key press and pointer
+    // motion, including our own backspaces) must not restart the interval, otherwise fast
+    // typing or moving the mouse starves pending backspaces and the addon gives up on them.
+    auto next_backspace_time = std::chrono::steady_clock::now();
 
     while (g_running.load(std::memory_order_acquire)) {
-        int poll_timeout = (pending_backspaces > 0) ? BACKSPACE_INTERVAL_MS : -1;
-        int ret          = poll(fds.data(), fds.size(), poll_timeout);
+        int poll_timeout = -1;
+        if (pending_backspaces > 0) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(next_backspace_time - std::chrono::steady_clock::now()).count();
+            poll_timeout   = remaining > 0 ? static_cast<int>(remaining) : 0;
+        }
+        int ret = poll(fds.data(), fds.size(), poll_timeout);
 
         if (ret < 0) {
             if (errno == EINTR) {
@@ -277,11 +286,10 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        if (ret == 0) {
-            if (pending_backspaces > 0) {
-                uinput.send_backspace();
-                --pending_backspaces;
-            }
+        if (pending_backspaces > 0 && std::chrono::steady_clock::now() >= next_backspace_time) {
+            uinput.send_backspace();
+            --pending_backspaces;
+            next_backspace_time = std::chrono::steady_clock::now() + BACKSPACE_INTERVAL;
         }
 
         libinput_dispatch(li_ctx.get_li());
@@ -335,7 +343,10 @@ int main(int argc, char* argv[]) {
                 LotusLogger::instance().warn("Keyboard client disconnected or connection error");
                 kb_client_fd.reset(-1);
                 fds[KB_CLIENT_INDEX].fd = -1;
-            } else {
+            } else if (count > 0) {
+                if (pending_backspaces == 0) {
+                    next_backspace_time = std::chrono::steady_clock::now() + BACKSPACE_INTERVAL;
+                }
                 pending_backspaces += count;
             }
         }

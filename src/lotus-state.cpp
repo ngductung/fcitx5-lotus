@@ -37,12 +37,19 @@ namespace fcitx {
     constexpr uint64_t UINPUT_OBSERVED_BACKSPACE_COMMIT_USEC  = 43000;
     constexpr uint64_t UINPUT_TERMINAL_BACKSPACE_COMMIT_USEC = 8000;
     constexpr uint64_t UINPUT_INITIAL_HOLD_USEC              = 24000;
+    // Server paces generated backspaces at 16 ms each; never give up before they can all arrive.
+    constexpr uint64_t UINPUT_SERVER_BACKSPACE_INTERVAL_USEC = 16000;
+    constexpr uint64_t UINPUT_BACKSPACE_ARRIVAL_SLACK_USEC   = 60000;
     constexpr bool     UINPUT_HOLD_INITIAL_PREEDIT            = true;
 
     static inline bool isWordBreak(uint32_t ucs4) {
         // Match Bamboo's punctuation-as-word-break behavior for surrounding-text rebuilds.
         return ucs4 == 0xFFFC || ucs4 == ' ' || ucs4 == '\t' || ucs4 == '\n' || ucs4 == '\r' || ucs4 == 0 || (ucs4 >= '!' && ucs4 <= '/') ||
                (ucs4 >= '0' && ucs4 <= '9') || (ucs4 >= ':' && ucs4 <= '@') || (ucs4 >= '[' && ucs4 <= '`') || (ucs4 >= '{' && ucs4 <= '~');
+    }
+
+    static inline bool endsWithWordBreak(const std::string& text) {
+        return !text.empty() && static_cast<unsigned char>(text.back()) < 0x80 && isWordBreak(static_cast<unsigned char>(text.back()));
     }
 
     static inline bool containsObjectReplacementChar(const std::string& text) {
@@ -743,7 +750,8 @@ namespace fcitx {
         pending_initial_hold_timer_.reset();
         holding_initial_uinput_preedit_ = false;
         pending_reset_engine_after_commit_ = false;
-        suppress_surrounding_seed_once_ = false;
+        // We just committed the word break ourselves; surrounding text may still show the previous word.
+        suppress_surrounding_seed_once_ = oldPreBuffer_.empty() && endsWithWordBreak(commitString);
         is_deleting_.store(false, std::memory_order_release);
 
         if (replayBuffered) {
@@ -798,6 +806,12 @@ namespace fcitx {
         });
     }
 
+    void LotusState::releaseReplacementOnFocusChange() {
+        if (is_deleting_.load(std::memory_order_acquire) && !pending_commit_fallback_timer_) {
+            cancelPendingReplacement(false);
+        }
+    }
+
     void LotusState::flushHeldInitialUinput(bool resetTimer) {
         if (resetTimer) {
             pending_initial_hold_timer_.reset();
@@ -841,6 +855,9 @@ namespace fcitx {
                 << " expected=" << expected_backspaces_;
             debugUinputTrace(oss.str());
         }
+        if (const int outstanding = expected_backspaces_ - current_backspace_count_; outstanding > 0) {
+            fallbackUsec = std::max(fallbackUsec, (static_cast<uint64_t>(outstanding) * UINPUT_SERVER_BACKSPACE_INTERVAL_USEC) + UINPUT_BACKSPACE_ARRIVAL_SLACK_USEC);
+        }
         const auto now      = ::fcitx::now(CLOCK_MONOTONIC);
         const auto deadline = now + fallbackUsec;
         const auto timeout  = now + (allowEarlyReadyCheck ? UINPUT_READY_CHECK_INITIAL_USEC : fallbackUsec);
@@ -861,6 +878,12 @@ namespace fcitx {
                     if (now < deadline) {
                         source->setNextInterval(UINPUT_READY_CHECK_INTERVAL_USEC);
                         return true;
+                    }
+                    if (ic && current_backspace_count_ >= deletedChars) {
+                        // The old text is already gone; committing is the only way not to lose it.
+                        debugUinputTrace("fallback_tick finish no_focus backspaces_observed");
+                        finishPendingReplacement(true, false);
+                        return false;
                     }
                     debugUinputTrace("fallback_tick cancel no_focus");
                     cancelPendingReplacement(false, false);
@@ -1029,6 +1052,7 @@ namespace fcitx {
             pending_replacement_may_empty_input_ = false;
             pending_reset_engine_after_commit_ = false;
             holding_initial_uinput_preedit_ = false;
+            suppress_surrounding_seed_once_ = false;
             hasHistory_ = false;
             ResetEngine(lotusEngine_.handle());
             oldPreBuffer_.clear();
@@ -1122,6 +1146,7 @@ namespace fcitx {
                 hasHistory_ = false;
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
+                suppress_surrounding_seed_once_ = true;
             }
             if (currentSym == FcitxKey_Return) {
                 forwardCurrentKeyDirect(keyEvent);
@@ -1281,6 +1306,7 @@ namespace fcitx {
                 hasHistory_ = false;
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
+                suppress_surrounding_seed_once_ = true;
                 return;
             }
 
@@ -1329,6 +1355,8 @@ namespace fcitx {
             hasHistory_ = false;
             ResetEngine(lotusEngine_.handle());
             oldPreBuffer_.clear();
+            // The word just ended here; don't rebuild it from not-yet-updated surrounding text.
+            suppress_surrounding_seed_once_ = true;
 
             return;
         }
@@ -1339,6 +1367,7 @@ namespace fcitx {
                 hasHistory_ = false;
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
+                suppress_surrounding_seed_once_ = true;
                 keyEvent.forward();
                 realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
             }
@@ -1798,7 +1827,12 @@ namespace fcitx {
                 scheduleReplayBufferedKeys();
             }
         }
-        if (needEngineReset.load() && realMode != LotusMode::Off) {
+        const bool replacementInFlight = is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_;
+        if ((needEngineReset.load() || g_mouse_clicked.load(std::memory_order_acquire)) && !replacementInFlight) {
+            // The held letter was typed before the click; commit it instead of dropping it.
+            flushHeldInitialUinput();
+        }
+        if (needEngineReset.load() && realMode != LotusMode::Off && !replacementInFlight) {
             LOTUS_DEBUG("Need engine reset");
             oldPreBuffer_.clear();
             hasHistory_ = false;
@@ -1814,7 +1848,7 @@ namespace fcitx {
             needEngineReset.store(false);
         }
 
-        if (g_mouse_clicked.load(std::memory_order_acquire) && !is_deleting_.load(std::memory_order_acquire)) {
+        if (g_mouse_clicked.load(std::memory_order_acquire) && !replacementInFlight) {
             g_mouse_clicked.store(false, std::memory_order_release);
             clearAllBuffers();
         }
@@ -1991,7 +2025,7 @@ namespace fcitx {
         const auto& text        = surrounding.text();
         size_t      textLen     = utf8::length(text);
         realtextLen.store(textLen, std::memory_order_release);
-        if (is_deleting_.load(std::memory_order_acquire)) {
+        if (is_deleting_.load(std::memory_order_acquire) || pending_replay_scheduled_) {
             return;
         }
 
@@ -2029,8 +2063,11 @@ namespace fcitx {
                 hasHistory_ = false;
             }
         }
-        if (!preserveUinputPreedit && getFrontendName(ic_) != "dbus")
+        if (!preserveUinputPreedit && getFrontendName(ic_) != "dbus") {
+            const bool suppressSeed = !isFocusOut && suppress_surrounding_seed_once_;
             clearAllBuffers();
+            suppress_surrounding_seed_once_ = suppressSeed;
+        }
 
         switch (realMode) {
             case LotusMode::Preedit: {
@@ -2150,6 +2187,7 @@ namespace fcitx {
                 hasHistory_ = false;
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
+                suppress_surrounding_seed_once_ = true;
                 replayBufferedSpecialKey(ic_, sym, state);
                 continue;
             }
@@ -2199,6 +2237,10 @@ namespace fcitx {
                     hasHistory_ = false;
                     ResetEngine(lotusEngine_.handle());
                     oldPreBuffer_.clear();
+                    if (!is_deleting_.load(std::memory_order_acquire)) {
+                        // Replaced via surrounding text; nothing will trigger the next replay cycle.
+                        scheduleReplayBufferedKeys();
+                    }
                     return;
                 }
                 if (!addedPart.empty()) {
@@ -2209,10 +2251,12 @@ namespace fcitx {
                 hasHistory_ = false;
                 ResetEngine(lotusEngine_.handle());
                 oldPreBuffer_.clear();
+                suppress_surrounding_seed_once_ = true;
                 continue;
             }
 
             if (!processed) {
+                suppress_surrounding_seed_once_ = oldPreBuffer_.empty();
                 ic_->commitString(keyUtf8);
                 realtextLen.fetch_add(static_cast<unsigned int>(utf8::length(keyUtf8)), std::memory_order_acq_rel);
                 continue;
@@ -2259,6 +2303,10 @@ namespace fcitx {
                     }
                     performReplacement(deletedPart, addedPart);
                     oldPreBuffer_ = preeditStr;
+                    if (!is_deleting_.load(std::memory_order_acquire)) {
+                        // Replaced via surrounding text; nothing will trigger the next replay cycle.
+                        scheduleReplayBufferedKeys();
+                    }
                     return;
                 }
             } else {
