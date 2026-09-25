@@ -10,6 +10,7 @@
 #include "lotus-engine.h"
 #include "lotus-candidates.h"
 #include "lotus-utils.h"
+#include "lotus-surrounding.h"
 #include "lotus.h"
 
 #include <cstddef>
@@ -30,7 +31,6 @@
 #include <thread>
 
 namespace fcitx {
-    constexpr int      MAX_SCAN_LENGTH = 15;
     constexpr uint64_t UINPUT_EMPTY_REPLACEMENT_FALLBACK_USEC = 120000;
     constexpr uint64_t UINPUT_READY_CHECK_INITIAL_USEC        = 24000;
     constexpr uint64_t UINPUT_READY_CHECK_INTERVAL_USEC       = 8000;
@@ -220,36 +220,7 @@ namespace fcitx {
             return "";
         }
 
-        const std::string& text   = surrounding.text();
-        unsigned int       cursor = surrounding.cursor();
-        size_t             textLen = utf8::lengthValidated(text);
-        if (textLen == utf8::INVALID_LENGTH || cursor == 0 || cursor > textLen) {
-            return "";
-        }
-
-        auto startIter = utf8::nextNChar(text.begin(), cursor);
-        auto endIter   = startIter;
-
-        int  scanCount = 0;
-        while (startIter != text.begin() && scanCount < MAX_SCAN_LENGTH) {
-            auto prev = startIter;
-            if (prev != text.begin()) {
-                --prev;
-                while (prev != text.begin() && ((*prev & 0xC0) == 0x80)) {
-                    --prev;
-                }
-            }
-
-            uint32_t ucs4 = utf8::getChar(prev, text.end());
-            if (isWordBreak(ucs4)) {
-                break;
-            }
-
-            startIter = prev;
-            ++scanCount;
-        }
-
-        return std::string(startIter, endIter);
+        return surroundingWordBeforeCursor(surrounding.text(), surrounding.cursor());
     }
 
     LotusState::LotusState(LotusEngine* engine, InputContext* ic) : engine_(engine), ic_(ic) {
@@ -1572,29 +1543,7 @@ namespace fcitx {
         }
 
         {
-            auto startIter = utf8::nextNChar(text.begin(), cursor);
-            auto endIter   = startIter;
-
-            int  scanCount = 0;
-            while (startIter != text.begin() && scanCount < MAX_SCAN_LENGTH) {
-                auto prev = startIter;
-                if (prev != text.begin()) {
-                    --prev;
-                    while (prev != text.begin() && ((*prev & 0xC0) == 0x80)) {
-                        --prev;
-                    }
-                }
-
-                uint32_t ucs4 = utf8::getChar(prev, text.end());
-
-                if (isWordBreak(ucs4))
-                    break;
-
-                startIter = prev;
-                ++scanCount;
-            }
-
-            std::string oldWord(startIter, endIter);
+            std::string oldWord = surroundingWordBeforeCursor(text, cursor);
 
             if (oldWord.empty()) {
                 processNormalKey(keyEvent, currentSym);

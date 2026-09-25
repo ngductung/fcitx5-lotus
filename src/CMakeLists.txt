@@ -8,6 +8,13 @@ set(fcitx_lotus_sources
   emoji.cpp
 )
 
+if(BUILD_TESTING)
+  add_executable(lotus-surrounding-test ../tests/surrounding-test.cpp)
+  target_include_directories(lotus-surrounding-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lotus-surrounding-test Fcitx5::Core Bamboo::Core)
+  add_test(NAME lotus-surrounding COMMAND lotus-surrounding-test)
+endif()
+
 add_library(lotus MODULE ${fcitx_lotus_sources})
 set_target_properties(lotus PROPERTIES OUTPUT_NAME "lotus")
 set_target_properties(lotus PROPERTIES POSITION_INDEPENDENT_CODE ON)
